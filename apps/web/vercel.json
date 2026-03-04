@@ -12,6 +12,10 @@
       "dest": "/api/storage/$1"
     },
     {
+      "src": "/sanctum/csrf-cookie",
+      "dest": "/api/sanctum/csrf-cookie"
+    },
+    {
       "src": "/(.*)",
       "dest": "/index.html"
     }
