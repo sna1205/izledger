@@ -9,7 +9,7 @@
     },
     {
       "src": "/api(?:/(.*))?",
-      "dest": "/api/$1"
+      "dest": "/api/[...path].js?path=$1"
     },
     {
       "src": "/storage(?:/(.*))?",

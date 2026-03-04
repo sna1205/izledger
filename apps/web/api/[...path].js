@@ -32,7 +32,7 @@ function getUpstreamSetCookieHeaders(upstreamResponse) {
   return typeof combined === 'string' && combined.trim() !== '' ? [combined] : []
 }
 
-module.exports = async function handler(req, res) {
+export default async function handler(req, res) {
   const apiBaseUrl = normalizeBaseUrl(process.env.API_BASE_URL || process.env.VITE_API_BASE_URL)
   if (apiBaseUrl === '') {
     res.status(500).json({
@@ -109,7 +109,7 @@ module.exports = async function handler(req, res) {
   }
 }
 
-module.exports.config = {
+export const config = {
   api: {
     bodyParser: false,
   },
