@@ -32,6 +32,18 @@ function getUpstreamSetCookieHeaders(upstreamResponse) {
   return typeof combined === 'string' && combined.trim() !== '' ? [combined] : []
 }
 
+function rewriteProxySetCookie(cookieValue) {
+  if (typeof cookieValue !== 'string' || cookieValue.trim() === '') return ''
+
+  // Remove Domain attribute so browser accepts cookie for current app host.
+  const parts = cookieValue
+    .split(';')
+    .map((part) => part.trim())
+    .filter((part, index) => !(index > 0 && /^domain=/i.test(part)))
+
+  return parts.join('; ')
+}
+
 export default async function handler(req, res) {
   const baseSource = process.env.SANCTUM_BASE_URL || process.env.API_BASE_URL || process.env.VITE_API_BASE_URL
   const sanctumBaseUrl = normalizeSanctumBaseUrl(baseSource)
@@ -59,6 +71,8 @@ export default async function handler(req, res) {
       headers,
     })
     const setCookieValues = getUpstreamSetCookieHeaders(upstream)
+      .map(rewriteProxySetCookie)
+      .filter((value) => value !== '')
     for (const [key, value] of upstream.headers.entries()) {
       const normalized = key.toLowerCase()
       if (normalized === 'set-cookie') continue
