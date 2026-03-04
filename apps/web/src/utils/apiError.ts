@@ -260,6 +260,7 @@ function defaultCodeByStatus(status: number | null): string {
   if (status === 422) return 'validation_failed'
   if (status === 409) return 'conflict'
   if (status === 412) return 'precondition_failed'
+  if (status === 419) return 'csrf_mismatch'
   if (status === 401) return 'unauthorized'
   return 'request_failed'
 }
@@ -268,6 +269,7 @@ function defaultMessageByStatus(status: number | null): string {
   if (status === 422) return 'Validation failed.'
   if (status === 409) return 'Request conflict.'
   if (status === 412) return 'Precondition failed.'
+  if (status === 419) return 'Security token expired. Please try again.'
   if (status === 401) return 'Unauthorized.'
   return 'Request failed.'
 }
