@@ -51,6 +51,8 @@ class AuthSessionSecurityTest extends TestCase
         $logoutAll->assertOk();
         $logoutAll->assertJsonPath('revoked_sessions', 2);
         $logoutAll->assertJsonPath('revoked_tokens', 2);
+        $logoutAll->assertJsonPath('supports_session_revocation', true);
+        $logoutAll->assertJsonPath('session_driver', 'database');
 
         $this->assertDatabaseMissing((string) config('session.table', 'sessions'), [
             'id' => 'session-alpha',
@@ -104,5 +106,33 @@ class AuthSessionSecurityTest extends TestCase
             'id' => $newToken->accessToken->id,
         ]);
         $this->assertNotNull($newToken->accessToken->expires_at);
+    }
+
+    public function test_logout_all_reports_when_other_device_session_revocation_is_not_supported(): void
+    {
+        config([
+            'session.driver' => 'file',
+            'session.lifetime' => 120,
+            'sanctum.expiration' => 120,
+        ]);
+
+        $user = User::factory()->create();
+        $revokedToken = $user->createToken('revoked-device')->plainTextToken;
+        $activeToken = $user->createToken('current-device')->plainTextToken;
+
+        app('auth')->forgetGuards();
+        $logoutAll = $this->withHeaders(['Authorization' => "Bearer {$activeToken}"])
+            ->postJson('/api/auth/logout-all');
+
+        $logoutAll->assertOk();
+        $logoutAll->assertJsonPath('revoked_sessions', 0);
+        $logoutAll->assertJsonPath('revoked_tokens', 2);
+        $logoutAll->assertJsonPath('supports_session_revocation', false);
+        $logoutAll->assertJsonPath('session_driver', 'file');
+
+        app('auth')->forgetGuards();
+        $this->withHeaders(['Authorization' => "Bearer {$revokedToken}"])
+            ->getJson('/api/auth/me')
+            ->assertUnauthorized();
     }
 }

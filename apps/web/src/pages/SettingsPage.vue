@@ -80,11 +80,19 @@ async function logoutOtherSessions() {
   try {
     const result = await authStore.logoutAll()
     lastRevokedSessions.value = Number(result?.revoked_sessions ?? 0)
-    uiStore.toast({
-      type: 'success',
-      title: 'Other sessions revoked',
-      message: `Revoked ${lastRevokedSessions.value} session(s).`,
-    })
+    if (result?.supports_session_revocation === false) {
+      uiStore.toast({
+        type: 'info',
+        title: 'Token revocation completed',
+        message: 'Other-device session revocation requires API SESSION_DRIVER=database.',
+      })
+    } else {
+      uiStore.toast({
+        type: 'success',
+        title: 'Other sessions revoked',
+        message: `Revoked ${lastRevokedSessions.value} session(s).`,
+      })
+    }
   } catch {
     uiStore.toast({
       type: 'error',

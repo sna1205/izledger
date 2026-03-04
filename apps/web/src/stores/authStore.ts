@@ -15,10 +15,6 @@ interface AuthUser {
   email: string
 }
 
-interface AuthResponse {
-  user: AuthUser
-}
-
 interface AuthConfigResponse {
   allow_self_register?: boolean
 }
@@ -27,6 +23,8 @@ interface LogoutAllResponse {
   message: string
   revoked_sessions: number
   revoked_tokens: number
+  supports_session_revocation: boolean
+  session_driver: string
 }
 
 let unauthorizedListenerBound = false
@@ -71,11 +69,7 @@ export const useAuthStore = defineStore('auth', () => {
     loading.value = true
     try {
       await fetchAuthConfig()
-      if (hasSessionCookie()) {
-        await fetchMe()
-      } else {
-        await clearSession()
-      }
+      await fetchMe()
     } catch {
       await clearSession()
     } finally {
@@ -106,11 +100,10 @@ export const useAuthStore = defineStore('auth', () => {
     loading.value = true
     try {
       await ensureCsrfCookie()
-      const { data } = await api.post<AuthResponse>('/auth/login', { email, password })
-      user.value = data.user
-      await setUserScope(data.user)
+      await api.post('/auth/login', { email, password })
+      const authenticatedUser = await fetchMe()
       initialized.value = true
-      return data.user
+      return authenticatedUser
     } finally {
       loading.value = false
     }
@@ -124,16 +117,15 @@ export const useAuthStore = defineStore('auth', () => {
     loading.value = true
     try {
       await ensureCsrfCookie()
-      const { data } = await api.post<AuthResponse>('/auth/register', {
+      await api.post('/auth/register', {
         name,
         email,
         password,
         password_confirmation: passwordConfirmation,
       })
-      user.value = data.user
-      await setUserScope(data.user)
+      const authenticatedUser = await fetchMe()
       initialized.value = true
-      return data.user
+      return authenticatedUser
     } finally {
       loading.value = false
     }
@@ -181,13 +173,3 @@ export const useAuthStore = defineStore('auth', () => {
     clearSession,
   }
 })
-
-function hasSessionCookie(): boolean {
-  if (typeof document === 'undefined') {
-    return false
-  }
-
-  return document.cookie
-    .split(';')
-    .some((chunk) => /_session=/.test(chunk.trim()))
-}

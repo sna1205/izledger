@@ -211,9 +211,11 @@ class AuthController extends Controller
         }
 
         $currentSessionId = $request->hasSession() ? (string) $request->session()->getId() : '';
+        $sessionDriver = (string) config('session.driver', 'file');
+        $supportsSessionRevocation = $sessionDriver === 'database';
 
         $revokedSessions = 0;
-        if ((string) config('session.driver', 'file') === 'database') {
+        if ($supportsSessionRevocation) {
             $sessions = DB::table((string) config('session.table', 'sessions'))
                 ->where('user_id', $user->getAuthIdentifier());
 
@@ -244,9 +246,13 @@ class AuthController extends Controller
         );
 
         return response()->json([
-            'message' => 'Other sessions and tokens revoked.',
+            'message' => $supportsSessionRevocation
+                ? 'Other sessions and tokens revoked.'
+                : 'Token revocation completed. Session revocation for other devices requires SESSION_DRIVER=database.',
             'revoked_sessions' => $revokedSessions,
             'revoked_tokens' => $revokedTokens,
+            'supports_session_revocation' => $supportsSessionRevocation,
+            'session_driver' => $sessionDriver,
         ]);
     }
 }
