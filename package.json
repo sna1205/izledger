@@ -9,5 +9,8 @@
     "test:api": "sh -lc 'cd apps/api && composer install && php artisan test'",
     "verify": "bash scripts/ci/verify.sh",
     "guard:root": "bash scripts/ci/check-root-clutter.sh"
+  },
+  "dependencies": {
+    "@vercel/analytics": "^1.6.1"
   }
 }

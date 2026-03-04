@@ -19,8 +19,36 @@ describe('api_error_normalizer_handles_422_and_409_consistently', () => {
 
     expect(normalized.status).toBe(422)
     expect(normalized.isValidation).toBe(true)
+    expect(normalized.message).toBe('Account is required.')
     expect(normalized.fieldErrors.account_id?.[0]).toBe('Account is required.')
     expect(normalized.failingRuleIds).toEqual([12, 34])
+  })
+
+  it('prefers field-level message when validation message is generic', () => {
+    const normalized = normalizeApiError({
+      isAxiosError: true,
+      response: {
+        status: 422,
+        data: {
+          error: {
+            status: 422,
+            code: 'validation_failed',
+            message: 'Validation failed.',
+            details: [
+              {
+                field: 'email',
+                message: 'Invalid email or password.',
+              },
+            ],
+          },
+          message: 'Validation failed.',
+        },
+      },
+    })
+
+    expect(normalized.status).toBe(422)
+    expect(normalized.message).toBe('Invalid email or password.')
+    expect(normalized.fieldErrors.email?.[0]).toBe('Invalid email or password.')
   })
 
   it('normalizes v2 409 conflict shape', () => {

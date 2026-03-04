@@ -67,16 +67,16 @@ export function normalizeApiError(error: unknown): NormalizedError {
   const code = toText(errorEnvelope?.code)
     ?? toText(data?.code)
     ?? defaultCodeByStatus(status)
-  const message = firstText(
-    toText(errorEnvelope?.message),
-    toText(data?.message),
-    firstFieldMessage(data),
-    defaultMessageByStatus(status)
-  )
   const details = normalizeDetails(errorEnvelope?.details ?? data?.details)
   const legacyErrors = normalizeLegacyErrors(data)
   const detailsAsFieldErrors = detailsToFieldErrors(details)
   const fieldErrors = mergeFieldErrors(legacyErrors, detailsAsFieldErrors)
+  const rawMessage = firstText(
+    toText(errorEnvelope?.message),
+    toText(data?.message),
+    defaultMessageByStatus(status)
+  )
+  const message = resolveMessage(status, rawMessage, firstFieldErrorMessage(fieldErrors))
   const meta = {
     ...toRecord(errorEnvelope?.meta),
     ...(toRecord(data?.current) ? { current: toRecord(data?.current) as Record<string, unknown> } : {}),
@@ -166,12 +166,26 @@ function mergeFieldErrors(
   return merged
 }
 
-function firstFieldMessage(data: Record<string, unknown> | null): string | null {
-  const errors = normalizeLegacyErrors(data)
-  for (const messages of Object.values(errors)) {
-    if (messages.length > 0) return messages[0] ?? null
+function firstFieldErrorMessage(fieldErrors: Record<string, string[]>): string | null {
+  for (const messages of Object.values(fieldErrors)) {
+    const first = messages[0]
+    if (typeof first === 'string' && first.trim() !== '') {
+      return first
+    }
   }
   return null
+}
+
+function resolveMessage(
+  status: number | null,
+  rawMessage: string,
+  fieldMessage: string | null
+): string {
+  if (status === 422 && fieldMessage && isGenericValidationMessage(rawMessage)) {
+    return fieldMessage
+  }
+
+  return rawMessage
 }
 
 function normalizeFailingRuleIds(data: Record<string, unknown> | null): number[] {
@@ -219,6 +233,18 @@ function toText(value: unknown): string | null {
   if (typeof value !== 'string') return null
   const trimmed = value.trim()
   return trimmed === '' ? null : trimmed
+}
+
+function isGenericValidationMessage(message: string): boolean {
+  const normalized = message.trim().toLowerCase()
+  return normalized === 'validation failed'
+    || normalized === 'validation failed.'
+    || normalized === 'the given data was invalid'
+    || normalized === 'the given data was invalid.'
+    || normalized === 'unprocessable entity'
+    || normalized === 'unprocessable entity.'
+    || normalized === 'unprocessable content'
+    || normalized === 'unprocessable content.'
 }
 
 function firstText(...values: Array<string | null | undefined>): string {

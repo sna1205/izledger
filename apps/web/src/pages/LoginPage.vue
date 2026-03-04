@@ -5,6 +5,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { Eye, EyeOff, LineChart, ShieldCheck, Sparkles, UserRound } from 'lucide-vue-next'
 import { useAuthStore } from '@/stores/authStore'
 import { useUserPreferencesStore } from '@/stores/userPreferencesStore'
+import { normalizeApiError } from '@/utils/apiError'
 
 type AuthMode = 'login' | 'register'
 
@@ -43,31 +44,6 @@ const heroSubtext = computed(() =>
     : 'Create a dedicated user workspace so all trades, accounts, and reports stay scoped to you.'
 )
 
-function extractApiErrorMessage(payload: unknown): string | null {
-  if (typeof payload === 'string') {
-    const trimmed = payload.trim()
-    if (trimmed === '') return null
-    if (/<(!doctype|html)/i.test(trimmed)) {
-      return 'API returned HTML instead of JSON. Verify Railway API_UPSTREAM_URL and backend route configuration.'
-    }
-    return trimmed
-  }
-
-  if (!payload || typeof payload !== 'object') return null
-
-  const maybeMessage = (payload as { message?: unknown }).message
-  if (typeof maybeMessage === 'string' && maybeMessage.trim() !== '') {
-    return maybeMessage
-  }
-
-  const maybeErrors = (payload as { errors?: Record<string, unknown> }).errors
-  if (!maybeErrors || typeof maybeErrors !== 'object') return null
-
-  return Object.values(maybeErrors)
-    .flat()
-    .find((value) => typeof value === 'string' && value.trim() !== '') as string | null
-}
-
 async function submit() {
   errorMessage.value = null
   if (!canSubmit.value) return
@@ -97,13 +73,13 @@ async function submit() {
         return
       }
 
-      const apiErrorMessage = extractApiErrorMessage(error.response?.data)
-      if (apiErrorMessage) {
-        errorMessage.value = apiErrorMessage
+      const payload = error.response?.data
+      if (typeof payload === 'string' && /<(!doctype|html)/i.test(payload.trim())) {
+        errorMessage.value = 'API returned HTML instead of JSON. Verify Railway API_UPSTREAM_URL and backend route configuration.'
         return
       }
 
-      errorMessage.value = `Authentication failed (HTTP ${error.response.status}).`
+      errorMessage.value = normalizeApiError(error).message
       return
     }
 
