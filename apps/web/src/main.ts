@@ -2,10 +2,10 @@ import { createApp } from 'vue'
 import { createPinia } from 'pinia'
 import './style.css'
 import App from './App.vue'
-import router from '@/router'
-import { useAuthStore } from '@/stores/authStore'
-import { useUiStore } from '@/stores/uiStore'
-import { useUserPreferencesStore } from '@/stores/userPreferencesStore'
+import router from './router'
+import { useAuthStore } from './stores/authStore'
+import { useUiStore } from './stores/uiStore'
+import { useUserPreferencesStore } from './stores/userPreferencesStore'
 
 async function bootstrap() {
   const app = createApp(App)
@@ -19,7 +19,11 @@ async function bootstrap() {
   const authStore = useAuthStore(pinia)
   await authStore.initialize()
   const userPreferencesStore = useUserPreferencesStore(pinia)
-  await userPreferencesStore.initialize(true)
+  try {
+    await userPreferencesStore.initialize(true)
+  } catch {
+    // Do not block initial render when preference sync is unauthorized/unavailable.
+  }
 
   app.use(router)
   app.mount('#app')
