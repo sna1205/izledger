@@ -8,8 +8,16 @@
       "handle": "filesystem"
     },
     {
+      "src": "/api(?:/(.*))?",
+      "dest": "/api/[...path].js?path=$1"
+    },
+    {
       "src": "/storage(?:/(.*))?",
       "dest": "/api/storage/$1"
+    },
+    {
+      "src": "/sanctum/csrf-cookie",
+      "dest": "/api/sanctum/csrf-cookie"
     },
     {
       "src": "/(.*)",

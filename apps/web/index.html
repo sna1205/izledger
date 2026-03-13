@@ -4,6 +4,13 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>IZLedger Analytics</title>
+    <script type="module">
+      window.va = window.va || function () { (window.vaq = window.vaq || []).push(arguments) }
+      const analyticsScript = document.createElement('script')
+      analyticsScript.defer = true
+      analyticsScript.src = '/_vercel/insights/script.js'
+      document.head.appendChild(analyticsScript)
+    </script>
   </head>
   <body>
     <div id="app"></div>

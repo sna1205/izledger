@@ -64,12 +64,22 @@ api.interceptors.request.use(async (config: InternalAxiosRequestConfig) => {
 
 api.interceptors.response.use(
   (response) => response,
-  (error) => {
+  async (error) => {
     const status = error?.response?.status
     if (status === 419) {
       csrfCookieReady = false
+      const originalConfig = error?.config as (InternalAxiosRequestConfig & { _csrfRetried?: boolean }) | undefined
+      if (canRetryAfterCsrfMismatch(originalConfig)) {
+        originalConfig._csrfRetried = true
+        try {
+          await ensureCsrfCookie(true)
+          return await api.request(originalConfig)
+        } catch {
+          // If CSRF refresh fails, surface original auth error.
+        }
+      }
     }
-    if (status === 401 || status === 419) {
+    if (status === 401) {
       window.dispatchEvent(new Event('auth:unauthorized'))
     }
     return Promise.reject(error)
@@ -94,6 +104,22 @@ function requiresIdempotencyKey(config: InternalAxiosRequestConfig): boolean {
   return path === '/trades'
     || /^\/trades\/\d+\/legs$/.test(path)
     || /^\/trades\/\d+\/images$/.test(path)
+}
+
+function canRetryAfterCsrfMismatch(
+  config?: InternalAxiosRequestConfig & { _csrfRetried?: boolean }
+): config is InternalAxiosRequestConfig & { _csrfRetried?: boolean } {
+  if (!config) {
+    return false
+  }
+  if (config._csrfRetried) {
+    return false
+  }
+  if (!requiresCsrf(config.method)) {
+    return false
+  }
+
+  return normalizeRequestPath(config.url) !== '/sanctum/csrf-cookie'
 }
 
 function attachIfMatchHeader(config: InternalAxiosRequestConfig): void {
