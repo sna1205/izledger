@@ -1,5 +1,6 @@
 import { createRouter, createWebHistory, type RouteRecordRaw } from 'vue-router'
 import { useAuthStore } from '../stores/authStore'
+import { resolveAuthNavigation } from './authNavigation'
 
 const AnalyticsPage = () => import('../pages/Dashboard.vue')
 const Trades = () => import('../pages/Trades.vue')
@@ -13,6 +14,7 @@ const TradingRulesPage = () => import('../pages/TradingRulesPage.vue')
 const SettingsPage = () => import('../pages/SettingsPage.vue')
 const LoginPage = () => import('../pages/LoginPage.vue')
 const LandingPage = () => import('../pages/LandingPage.vue')
+const ProductTourPage = () => import('../pages/ProductTourPage.vue')
 const UiRegressionPage = () => import('../pages/UiRegressionPage.vue')
 
 const includeVisualRoutes = import.meta.env.DEV || import.meta.env.VITE_ENABLE_VISUAL_ROUTES === '1'
@@ -56,6 +58,16 @@ const router = createRouter({
       path: '/',
       name: 'landing',
       component: LandingPage,
+      meta: {
+        public: true,
+        layout: 'auth',
+      },
+    },
+    {
+      path: '/product-tour',
+      alias: ['/preview'],
+      name: 'product-tour',
+      component: ProductTourPage,
       meta: {
         public: true,
         layout: 'auth',
@@ -206,28 +218,17 @@ router.beforeEach(async (to) => {
     await authStore.initialize()
   }
 
-  const isGuestOnly = to.matched.some((record) => record.meta.guestOnly)
-  const requiresSelfRegister = to.matched.some((record) => record.meta.requiresSelfRegister)
-  if (requiresSelfRegister && !authStore.allowSelfRegister) {
-    return { name: 'auth-login' }
-  }
-
-  if (isGuestOnly && authStore.isAuthenticated) {
-    const redirectTarget = typeof to.query.redirect === 'string' && to.query.redirect !== ''
-      ? to.query.redirect
-      : '/dashboard'
-    return redirectTarget
-  }
-
-  const requiresAuth = to.matched.some((record) => record.meta.requiresAuth)
-  if (requiresAuth && !authStore.isAuthenticated) {
-    return {
-      path: '/auth/login',
-      query: { redirect: to.fullPath },
+  return resolveAuthNavigation(
+    {
+      matched: to.matched,
+      query: to.query,
+      fullPath: to.fullPath,
+    },
+    {
+      authStatus: authStore.status,
+      allowSelfRegister: authStore.allowSelfRegister,
     }
-  }
-
-  return true
+  )
 })
 
 export default router

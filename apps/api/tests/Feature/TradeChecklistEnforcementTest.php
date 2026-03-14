@@ -393,6 +393,7 @@ class TradeChecklistEnforcementTest extends TestCase
         $response->assertJsonPath('checklist_evaluation.failed_rule_reasons.0.checklist_item_id', (int) $requiredItem->id);
         $this->assertDatabaseHas('trades', [
             'id' => $tradeId,
+            'followed_rules' => 0,
             'checklist_incomplete' => 1,
             'executed_enforcement_mode' => 'soft',
         ]);

@@ -38,10 +38,14 @@ jobs:
           node-version: 22
       - name: Install
         run: npm --prefix apps/web ci
+      - name: Install Playwright browsers
+        run: npx --prefix apps/web playwright install --with-deps chromium
       - name: Build
         run: npm --prefix apps/web run build
       - name: Test
         run: npm --prefix apps/web run test
+      - name: E2E
+        run: npm --prefix apps/web run test:e2e -- --project=desktop
 
   api:
     runs-on: ubuntu-latest

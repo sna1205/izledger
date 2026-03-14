@@ -8,7 +8,8 @@
     "build": "vue-tsc -b && vite build",
     "preview": "vite preview",
     "test": "npm run test:unit",
-    "test:unit": "vitest run src/utils/lotSizeEngine.test.ts src/services/fxToUsdService.test.ts",
+    "test:unit": "vitest run src/utils/lotSizeEngine.test.ts src/utils/tradeValidation.test.ts src/utils/missedTradeValidation.test.ts src/utils/tradeQualityRoute.test.ts src/utils/tradeRuleWorkflow.test.ts src/utils/imageUploadWorkflow.test.ts src/utils/dashboardRoute.test.ts src/utils/tradeEditHydration.test.ts src/services/fxToUsdService.test.ts src/services/tradeDraftPersistence.test.ts src/router/authNavigation.test.ts src/appShell.test.ts src/stores/authStore.bootstrap.test.ts src/stores/uiStore.theme.test.ts src/stores/tradeStore.quality.test.ts src/stores/tradeStore.fetchTrades.quality.test.ts",
+    "test:e2e": "playwright test --config=playwright.app.config.ts",
     "test:visual": "playwright test --config=playwright.visual.config.ts",
     "test:visual:update": "playwright test --config=playwright.visual.config.ts --update-snapshots"
   },

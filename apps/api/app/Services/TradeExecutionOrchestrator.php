@@ -54,11 +54,7 @@ class TradeExecutionOrchestrator
                 true,
                 $this->strictGateFailureHandler()
             );
-            $payloadWithMetrics['checklist_incomplete'] = $checklistGate['checklist_incomplete'];
-            $payloadWithMetrics = [
-                ...$payloadWithMetrics,
-                ...$checklistGate['snapshot_attributes'],
-            ];
+            $payloadWithMetrics = $this->applyChecklistOutcomeToPayload($payloadWithMetrics, $checklistGate);
 
             $legs = $this->normalizeLegsForWrite($payloadWithMetrics['legs'] ?? [], (string) $payloadWithMetrics['date']);
             $createdTrade = Trade::query()->create($this->extractTradeAttributes($payloadWithMetrics));
@@ -117,11 +113,7 @@ class TradeExecutionOrchestrator
                 true,
                 $this->strictGateFailureHandler()
             );
-            $payloadWithMetrics['checklist_incomplete'] = $checklistGate['checklist_incomplete'];
-            $payloadWithMetrics = [
-                ...$payloadWithMetrics,
-                ...$checklistGate['snapshot_attributes'],
-            ];
+            $payloadWithMetrics = $this->applyChecklistOutcomeToPayload($payloadWithMetrics, $checklistGate);
 
             $nextRevision = (int) $trade->revision + 1;
             $trade->update([
@@ -204,11 +196,7 @@ class TradeExecutionOrchestrator
                 true,
                 $this->strictGateFailureHandler()
             );
-            $payloadWithMetrics['checklist_incomplete'] = $checklistGate['checklist_incomplete'];
-            $payloadWithMetrics = [
-                ...$payloadWithMetrics,
-                ...$checklistGate['snapshot_attributes'],
-            ];
+            $payloadWithMetrics = $this->applyChecklistOutcomeToPayload($payloadWithMetrics, $checklistGate);
 
             $operationResult = $this->persistLegOperations($trade, $operations);
             $nextRevision = (int) $trade->revision + 1;
@@ -715,6 +703,7 @@ class TradeExecutionOrchestrator
         $lotSizeFromLegs = $legSummary['entry_quantity'] > 0
             ? $legSummary['entry_quantity']
             : (float) ($payload['lot_size'] ?? 0);
+        $this->assertCalculatedTradeIntegrity($payload, $calculated, $lotSizeFromLegs);
 
         return [
             ...$prepared,
@@ -736,7 +725,9 @@ class TradeExecutionOrchestrator
         try {
             return CarbonImmutable::parse($value);
         } catch (\Throwable) {
-            return CarbonImmutable::now();
+            throw ValidationException::withMessages([
+                'date' => ['Close date is invalid.'],
+            ]);
         }
     }
 
@@ -911,10 +902,9 @@ class TradeExecutionOrchestrator
             $executedAt = (string) ($row['executed_at'] ?? '');
             $timestamp = strtotime($executedAt);
             if ($timestamp === false) {
-                $fallbackTimestamp = strtotime($fallbackExecutedAt);
-                $timestamp = $fallbackTimestamp !== false
-                    ? ($fallbackTimestamp + (int) $index)
-                    : (time() + (int) $index);
+                throw ValidationException::withMessages([
+                    "legs.$index.executed_at" => ['Leg execution time is invalid.'],
+                ]);
             }
 
             $normalized[] = [
@@ -1037,6 +1027,60 @@ class TradeExecutionOrchestrator
                 'account_currency',
             ])
             ->all();
+    }
+
+    /**
+     * @param  array<string,mixed>  $payloadWithMetrics
+     * @param  array<string,mixed>  $checklistGate
+     * @return array<string,mixed>
+     */
+    private function applyChecklistOutcomeToPayload(array $payloadWithMetrics, array $checklistGate): array
+    {
+        $snapshotAttributes = is_array($checklistGate['snapshot_attributes'] ?? null)
+            ? $checklistGate['snapshot_attributes']
+            : [];
+        $failedRuleIds = collect(is_array($snapshotAttributes['failed_rule_ids'] ?? null) ? $snapshotAttributes['failed_rule_ids'] : [])
+            ->map(fn ($id): int => (int) $id)
+            ->filter(fn (int $id): bool => $id > 0)
+            ->values()
+            ->all();
+
+        $hasChecklistContext = $checklistGate['checklist'] instanceof Checklist
+            || ($snapshotAttributes['executed_checklist_id'] ?? null) !== null
+            || ($snapshotAttributes['executed_enforcement_mode'] ?? null) !== null;
+        $checklistIncomplete = (bool) ($checklistGate['checklist_incomplete'] ?? false);
+
+        return [
+            ...$payloadWithMetrics,
+            'followed_rules' => $hasChecklistContext
+                ? (! $checklistIncomplete && count($failedRuleIds) === 0)
+                : (bool) ($payloadWithMetrics['followed_rules'] ?? true),
+            'checklist_incomplete' => $checklistIncomplete,
+            ...$snapshotAttributes,
+        ];
+    }
+
+    /**
+     * @param array<string,mixed> $payload
+     * @param array<string,mixed> $calculated
+     */
+    private function assertCalculatedTradeIntegrity(array $payload, array $calculated, float $lotSize): void
+    {
+        $entryPrice = (float) ($calculated['avg_entry_price'] ?? $payload['entry_price'] ?? 0);
+        $stopLoss = (float) ($payload['stop_loss'] ?? 0);
+        $monetaryRisk = (float) ($calculated['monetary_risk'] ?? 0);
+
+        if ($lotSize <= 0) {
+            throw ValidationException::withMessages([
+                'lot_size' => ['Position size must be greater than 0.'],
+            ]);
+        }
+
+        if ($entryPrice <= 0 || $stopLoss <= 0 || ! (abs($entryPrice - $stopLoss) * $lotSize > 0) || $monetaryRisk <= 0) {
+            throw ValidationException::withMessages([
+                'stop_loss' => ['Risk must be greater than 0. Check entry, stop loss, and position size.'],
+            ]);
+        }
     }
 
     /**

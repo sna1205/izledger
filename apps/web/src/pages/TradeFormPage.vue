@@ -28,8 +28,31 @@ import { useTradeRulesStore } from '@/stores/tradeRulesStore'
 import { useSyncStatusStore } from '@/stores/syncStatusStore'
 import { useUiStore } from '@/stores/uiStore'
 import type { ImageContextTag, Instrument, Paginated, SessionEnum, Trade, TradeEmotion, TradeImage, TradeLeg, TradePsychology } from '@/types/trade'
+import {
+  clearTradeFormDraft,
+  readTradeFormDraft,
+  writeTradeFormDraft,
+  type PersistedTradeDraftPayload,
+} from '@/services/tradeDraftPersistence'
+import { isOfflineModeEnabled } from '@/services/localFallback'
 import { normalizeApiError, type NormalizedError } from '@/utils/apiError'
+import {
+  createIdleUploadStatus,
+  createUploadStatus,
+  DEFAULT_ALLOWED_IMAGE_TYPES,
+  preparePendingImages,
+  removeUploadProgressEntry,
+  revokePendingImagePreview,
+  type ImageUploadStatus,
+} from '@/utils/imageUploadWorkflow'
+import { parseTradeDateTime, validateTradeIntegrity } from '@/utils/tradeValidation'
 import { asCurrency, asSignedCurrency } from '@/utils/format'
+import {
+  deriveTradeFollowedRules,
+  resolveChecklistWorkflowFailures,
+  resolveChecklistWorkflowReadiness,
+} from '@/utils/tradeRuleWorkflow'
+import { shouldApplyTradeHydration } from '@/utils/tradeEditHydration'
 
 const router = useRouter()
 const route = useRoute()
@@ -40,7 +63,14 @@ const syncStatusStore = useSyncStatusStore()
 const uiStore = useUiStore()
 const { accounts } = storeToRefs(accountStore)
 const { instruments, strategyModels, setups, killzones, tradeTags, sessionOptions, fxRates } = storeToRefs(tradeStore)
-const { isFallbackMode } = storeToRefs(syncStatusStore)
+const {
+  browserOnline,
+  isFallbackMode,
+  pendingQueueCount,
+  queueSummary,
+  syncing,
+  lastSyncError,
+} = storeToRefs(syncStatusStore)
 const {
   checklist: activeChecklist,
   items: checklistItems,
@@ -56,7 +86,6 @@ const {
   resolverContextCurrent: checklistResolverContextCurrent,
   submitAttempted: checklistSubmitAttempted,
   isStrict: checklistStrictMode,
-  checklistIncomplete,
   serverReadinessMismatch: checklistServerReadinessMismatch,
   serverReadinessReasons: checklistServerReadinessReasons,
   hasChecklist,
@@ -214,18 +243,10 @@ interface PendingTradeImage {
 const MAX_IMAGE_COUNT = 5
 const MAX_IMAGE_SIZE_BYTES = 5 * 1024 * 1024
 const MAX_TOTAL_IMAGE_BYTES = 20 * 1024 * 1024
-const allowedImageTypes = new Set([
-  'image/jpeg',
-  'image/jpg',
-  'image/png',
-  'image/webp',
-  'image/bmp',
-])
 
 const existingImages = ref<TradeImage[]>([])
 const pendingImages = ref<PendingTradeImage[]>([])
-const imageUploadError = ref('')
-const uploadingImages = ref(false)
+const imageUploadStatus = ref<ImageUploadStatus>(createIdleUploadStatus())
 const deletingImageIds = ref<number[]>([])
 const uploadProgressByPendingId = ref<Record<string, number>>({})
 const postSaveQueue = reactive({
@@ -242,6 +263,8 @@ const staleWriteWarning = ref<{
 } | null>(null)
 let editLockHandle: TradeEditLockHandle | null = null
 let releaseEditLockSubscription: (() => void) | null = null
+let tradeHydrationRequestId = 0
+let draftPersistenceTimer: ReturnType<typeof setTimeout> | null = null
 
 const tradeId = computed(() => {
   const value = Number(route.params.id)
@@ -250,15 +273,31 @@ const tradeId = computed(() => {
 const isEditMode = computed(() => tradeId.value !== null)
 const loadingSmartDefaults = ref(false)
 const tradeCompleted = ref(true)
+const draftPersistenceEnabled = ref(false)
+const draftPersistenceReady = ref(false)
+const draftPersistenceState = ref<'disabled' | 'idle' | 'available' | 'saving' | 'saved' | 'restored' | 'error'>('disabled')
+const draftPersistenceSavedAt = ref<string | null>(null)
+const draftPersistenceError = ref('')
+const autoRestoreSkippedDraft = ref(false)
+const hasPersistedTradeDraft = ref(false)
+const createDraftDefaultFingerprint = ref('')
 const pageTitle = computed(() => (isEditMode.value ? 'Edit Execute' : 'New Execute'))
 const tradeFormId = 'trade-execution-form'
 const closeDateMax = computed(() => maxDateTime(nowLocalDateTime(), form.date || ''))
+const uploadingImages = computed(() =>
+  imageUploadStatus.value.state === 'validating' || imageUploadStatus.value.state === 'uploading'
+)
 const totalImageCount = computed(() => existingImages.value.length + pendingImages.value.length)
 const totalImageSize = computed(() => {
   const existingTotal = existingImages.value.reduce((sum, image) => sum + Number(image.file_size || 0), 0)
   const pendingTotal = pendingImages.value.reduce((sum, image) => sum + image.file.size, 0)
   return existingTotal + pendingTotal
 })
+const imageUploadRetryable = computed(() =>
+  imageUploadStatus.value.canRetry
+  && pendingImages.value.length > 0
+  && postSaveQueue.lastSavedTradeId !== null
+)
 const hasPendingPostSave = computed(() =>
   postSaveQueue.lastSavedTradeId !== null
   && (postSaveQueue.pendingPsychology || postSaveQueue.pendingImages)
@@ -300,7 +339,6 @@ const selectedSetup = computed(() => {
   return setups.value.find((item) => item.id === id) ?? null
 })
 const instrumentSymbol = computed(() => selectedInstrument.value?.symbol ?? form.symbol.trim().toUpperCase())
-const failedRequiredRuleIds = ref<number[]>([])
 let checklistPreviewTimer: ReturnType<typeof setTimeout> | null = null
 const selectedChecklistAccountId = computed(() => {
   const id = Number(form.account_id)
@@ -336,15 +374,42 @@ const isSaveBlocked = computed(() =>
 const isChecklistStrictBlocked = computed(() =>
   checklistStrictMode.value
   && hasChecklist.value
-  && checklistIncomplete.value
+  && !resolvedChecklistReadiness.value.ready
+)
+const resolvedChecklistReadiness = computed(() =>
+  resolveChecklistWorkflowReadiness({
+    readiness: checklistReadiness.value,
+    serverReadiness: checklistServerReadiness.value,
+    executionSnapshot: checklistExecutionSnapshot.value ?? null,
+  })
+)
+const resolvedChecklistFailures = computed(() =>
+  resolveChecklistWorkflowFailures({
+    readiness: checklistReadiness.value,
+    serverReadiness: checklistServerReadiness.value,
+    serverReadinessReasons: checklistServerReadinessReasons.value,
+    executionSnapshot: checklistExecutionSnapshot.value ?? null,
+  })
 )
 const checklistGateIncomplete = computed(() =>
-  hasChecklist.value && (checklistIncomplete.value || failedRequiredRuleIds.value.length > 0)
+  hasChecklist.value && !resolvedChecklistReadiness.value.ready
 )
 const showSoftChecklistNotice = computed(() =>
   hasChecklist.value
   && !checklistStrictMode.value
   && checklistGateIncomplete.value
+)
+const derivedFollowedRules = computed(() =>
+  deriveTradeFollowedRules(
+    hasChecklist.value,
+    form.followed_rules,
+    {
+      readiness: checklistReadiness.value,
+      serverReadiness: checklistServerReadiness.value,
+      serverReadinessReasons: checklistServerReadinessReasons.value,
+      executionSnapshot: checklistExecutionSnapshot.value ?? null,
+    }
+  )
 )
 const isLockedByOtherTab = computed(() =>
   isEditMode.value
@@ -369,7 +434,7 @@ const blockedSummary = computed(() => {
   if (isFxPending.value) return 'Fetching FX quote...'
   if (isChecklistContextMismatch.value) return 'Rule context is refreshing for the selected account and strategy.'
   if (isChecklistStrictBlocked.value) {
-    const firstReason = checklistReadiness.value.missing_required[0]?.reason?.trim()
+    const firstReason = resolvedChecklistFailures.value[0]?.reason?.trim()
     return firstReason || 'Strict mode is blocked by checklist readiness.'
   }
   if (liveFxConversionError.value) return liveFxConversionError.value
@@ -591,11 +656,401 @@ function setPsychologyFromPayload(payload?: TradePsychology | null) {
   psychology.notes = payload?.notes ?? ''
 }
 
-function parseLocalDateTime(value: string): number | null {
-  if (!value) return null
-  const timestamp = new Date(value).getTime()
-  if (Number.isNaN(timestamp)) return null
-  return timestamp
+function resetTradeFormState() {
+  form.account_id = ''
+  form.instrument_id = ''
+  form.strategy_model_id = ''
+  form.setup_id = ''
+  form.killzone_id = ''
+  form.session_enum = ''
+  form.symbol = ''
+  form.direction = 'buy'
+  form.date = nowLocalDateTime()
+  form.entry_price = 0
+  form.stop_loss = 0
+  form.take_profit = 0
+  form.position_size = 0.01
+  form.commission = 0
+  form.swap = 0
+  form.spread_cost = 0
+  form.slippage_cost = 0
+  form.followed_rules = true
+  form.emotion = 'neutral'
+  form.notes = ''
+  form.tag_ids = []
+  form.tag_search = ''
+
+  resetPrimaryExit({
+    price: 0,
+    quantity_lots: 0,
+    executed_at: form.date,
+    fees: 0,
+    notes: '',
+  })
+  exitLegs.value = []
+  setPsychologyFromPayload(null)
+
+  existingImages.value = []
+  deletingImageIds.value = []
+  submitAttempted.value = false
+  serverFieldErrors.value = {}
+  loadedTradeUpdatedAt.value = null
+  staleWriteCheckInProgress.value = false
+  clearStaleWriteWarning()
+  clearPendingImages()
+  clearPostSaveQueue()
+  tradeCompleted.value = true
+}
+
+function refreshDraftPersistencePreference() {
+  draftPersistenceEnabled.value = !isEditMode.value && isOfflineModeEnabled()
+  if (!draftPersistenceEnabled.value) {
+    draftPersistenceState.value = 'disabled'
+    draftPersistenceError.value = ''
+    autoRestoreSkippedDraft.value = false
+    hasPersistedTradeDraft.value = false
+    draftPersistenceSavedAt.value = null
+    createDraftDefaultFingerprint.value = ''
+  }
+}
+
+function clearDraftPersistenceTimer() {
+  if (!draftPersistenceTimer) return
+  clearTimeout(draftPersistenceTimer)
+  draftPersistenceTimer = null
+}
+
+function isQuickTradeQueryActive() {
+  return `${route.query.quick ?? ''}` === '1'
+}
+
+function buildTradeDraftPayload(): PersistedTradeDraftPayload {
+  return {
+    version: 1,
+    trade_completed: tradeCompleted.value,
+    form: {
+      account_id: form.account_id,
+      instrument_id: form.instrument_id,
+      strategy_model_id: form.strategy_model_id,
+      setup_id: form.setup_id,
+      killzone_id: form.killzone_id,
+      session_enum: form.session_enum,
+      symbol: form.symbol,
+      direction: form.direction,
+      date: form.date,
+      entry_price: toNumber(form.entry_price),
+      stop_loss: toNumber(form.stop_loss),
+      take_profit: toNumber(form.take_profit),
+      position_size: toNumber(form.position_size),
+      commission: toNumber(form.commission),
+      swap: toNumber(form.swap),
+      spread_cost: toNumber(form.spread_cost),
+      slippage_cost: toNumber(form.slippage_cost),
+      followed_rules: Boolean(form.followed_rules),
+      emotion: form.emotion,
+      notes: form.notes,
+      tag_ids: form.tag_ids.slice(),
+    },
+    psychology: {
+      pre_emotion: psychology.pre_emotion,
+      post_emotion: psychology.post_emotion,
+      confidence_score: psychology.confidence_score,
+      stress_score: psychology.stress_score,
+      sleep_hours: psychology.sleep_hours,
+      impulse_flag: psychology.impulse_flag,
+      fomo_flag: psychology.fomo_flag,
+      revenge_flag: psychology.revenge_flag,
+      notes: psychology.notes,
+    },
+    primary_exit: {
+      price: toNumber(primaryExit.price),
+      quantity_lots: toNumber(primaryExit.quantity_lots),
+      executed_at: primaryExit.executed_at,
+      fees: toNumber(primaryExit.fees),
+      notes: primaryExit.notes,
+    },
+    exit_legs: exitLegs.value.map((leg) => ({
+      id: leg.id,
+      price: toNumber(leg.price),
+      quantity_lots: toNumber(leg.quantity_lots),
+      executed_at: leg.executed_at,
+      fees: toNumber(leg.fees),
+      notes: leg.notes,
+    })),
+    pending_images: pendingImages.value.map((image) => ({
+      id: image.id,
+      file: image.file,
+      context_tag: image.context_tag,
+      timeframe: image.timeframe,
+      annotation_notes: image.annotation_notes,
+    })),
+  }
+}
+
+function createTradeDraftFingerprint(payload: PersistedTradeDraftPayload) {
+  return JSON.stringify({
+    ...payload,
+    pending_images: payload.pending_images.map((image) => ({
+      id: image.id,
+      file_name: image.file.name,
+      file_size: image.file.size,
+      file_type: image.file.type,
+      last_modified: image.file.lastModified,
+      context_tag: image.context_tag,
+      timeframe: image.timeframe,
+      annotation_notes: image.annotation_notes,
+    })),
+  })
+}
+
+function applyPersistedTradeDraft(payload: PersistedTradeDraftPayload) {
+  tradeCompleted.value = payload.trade_completed
+  form.account_id = payload.form.account_id
+  form.instrument_id = payload.form.instrument_id
+  form.strategy_model_id = payload.form.strategy_model_id
+  form.setup_id = payload.form.setup_id
+  form.killzone_id = payload.form.killzone_id
+  form.session_enum = payload.form.session_enum as '' | SessionEnum
+  form.symbol = payload.form.symbol
+  form.direction = payload.form.direction
+  form.date = payload.form.date
+  form.entry_price = payload.form.entry_price
+  form.stop_loss = payload.form.stop_loss
+  form.take_profit = payload.form.take_profit
+  form.position_size = payload.form.position_size
+  form.commission = payload.form.commission
+  form.swap = payload.form.swap
+  form.spread_cost = payload.form.spread_cost
+  form.slippage_cost = payload.form.slippage_cost
+  form.followed_rules = payload.form.followed_rules
+  form.emotion = payload.form.emotion as TradeEmotion
+  form.notes = payload.form.notes
+  form.tag_ids = payload.form.tag_ids.slice()
+  form.tag_search = ''
+
+  psychology.pre_emotion = payload.psychology.pre_emotion
+  psychology.post_emotion = payload.psychology.post_emotion
+  psychology.confidence_score = payload.psychology.confidence_score
+  psychology.stress_score = payload.psychology.stress_score
+  psychology.sleep_hours = payload.psychology.sleep_hours
+  psychology.impulse_flag = payload.psychology.impulse_flag
+  psychology.fomo_flag = payload.psychology.fomo_flag
+  psychology.revenge_flag = payload.psychology.revenge_flag
+  psychology.notes = payload.psychology.notes
+
+  resetPrimaryExit({
+    price: payload.primary_exit.price,
+    quantity_lots: payload.primary_exit.quantity_lots,
+    executed_at: payload.primary_exit.executed_at,
+    fees: payload.primary_exit.fees,
+    notes: payload.primary_exit.notes,
+  })
+  exitLegs.value = payload.exit_legs.map((leg) => makeExitLeg({
+    price: leg.price,
+    quantity_lots: leg.quantity_lots,
+    executed_at: leg.executed_at,
+    fees: leg.fees,
+    notes: leg.notes,
+  }))
+
+  clearPendingImages()
+  pendingImages.value = payload.pending_images.map((image) => ({
+    id: image.id,
+    file: image.file,
+    preview_url: URL.createObjectURL(image.file),
+    context_tag: image.context_tag as ImageContextTag,
+    timeframe: image.timeframe,
+    annotation_notes: image.annotation_notes,
+  }))
+}
+
+function formatDraftSavedAt(value: string | null): string {
+  if (!value) return ''
+  const parsed = Date.parse(value)
+  if (!Number.isFinite(parsed)) return value
+  return new Date(parsed).toLocaleString()
+}
+
+const tradeDraftFingerprint = computed(() => createTradeDraftFingerprint(buildTradeDraftPayload()))
+const hasMeaningfulDraftChanges = computed(() =>
+  !isEditMode.value
+  && createDraftDefaultFingerprint.value !== ''
+  && tradeDraftFingerprint.value !== createDraftDefaultFingerprint.value
+)
+const tradeDraftStatusMessage = computed(() => {
+  if (isEditMode.value) return ''
+  if (!draftPersistenceEnabled.value) {
+    return 'Offline draft persistence is off. Unsaved changes on this page will not survive leaving the route.'
+  }
+  if (draftPersistenceState.value === 'saving') {
+    return 'Saving this draft locally...'
+  }
+  if (draftPersistenceState.value === 'saved' && draftPersistenceSavedAt.value) {
+    return `Draft saved locally at ${formatDraftSavedAt(draftPersistenceSavedAt.value)}.`
+  }
+  if (draftPersistenceState.value === 'restored' && draftPersistenceSavedAt.value) {
+    return `Restored local draft from ${formatDraftSavedAt(draftPersistenceSavedAt.value)}.`
+  }
+  if (draftPersistenceState.value === 'available' && draftPersistenceSavedAt.value) {
+    return `A local draft from ${formatDraftSavedAt(draftPersistenceSavedAt.value)} is available to restore.`
+  }
+  if (draftPersistenceState.value === 'error') {
+    return draftPersistenceError.value || 'Local draft persistence is unavailable right now.'
+  }
+  if (hasMeaningfulDraftChanges.value) {
+    return 'Unsynced local draft changes are in progress.'
+  }
+  return 'No local draft is currently stored for this form.'
+})
+const tradeDraftBannerTitle = computed(() => {
+  if (browserOnline.value === false) return 'Offline right now'
+  if (isFallbackMode.value) return 'Local sync backlog active'
+  if (pendingQueueCount.value > 0) return 'Queued drafts waiting to sync'
+  return 'Draft persistence'
+})
+const tradeDraftBannerMessage = computed(() => {
+  if (browserOnline.value === false) {
+    return 'This device is offline. New executions can be stored locally and synced when connectivity returns.'
+  }
+  if (isFallbackMode.value) {
+    return 'The app is using local draft mode. New saves may remain on this device until the server is reachable again.'
+  }
+  if (pendingQueueCount.value > 0) {
+    return `${queueSummary.value.draft_local} draft, ${queueSummary.value.pending_sync} pending, and ${queueSummary.value.conflict} conflict item(s) are in the sync queue.`
+  }
+  return 'Offline mode controls whether in-progress drafts on this page persist locally between visits.'
+})
+const canRestorePersistedDraft = computed(() =>
+  !isEditMode.value
+  && draftPersistenceEnabled.value
+  && autoRestoreSkippedDraft.value
+  && hasPersistedTradeDraft.value
+)
+const showTradeDraftBanner = computed(() =>
+  !isEditMode.value
+  && (
+    !draftPersistenceEnabled.value
+    || draftPersistenceState.value !== 'idle'
+    || browserOnline.value === false
+    || isFallbackMode.value
+    || pendingQueueCount.value > 0
+    || Boolean(lastSyncError.value)
+  )
+)
+
+async function maybeRestorePersistedTradeDraft(skipAutoRestore = false) {
+  refreshDraftPersistencePreference()
+  if (!draftPersistenceEnabled.value) return false
+
+  try {
+    const restored = await readTradeFormDraft()
+    if (!restored) {
+      hasPersistedTradeDraft.value = false
+      autoRestoreSkippedDraft.value = false
+      if (draftPersistenceState.value !== 'restored') {
+        draftPersistenceState.value = 'idle'
+      }
+      return false
+    }
+
+    hasPersistedTradeDraft.value = true
+    draftPersistenceSavedAt.value = restored.savedAt
+    draftPersistenceError.value = ''
+
+    if (skipAutoRestore) {
+      autoRestoreSkippedDraft.value = true
+      draftPersistenceState.value = 'available'
+      return false
+    }
+
+    autoRestoreSkippedDraft.value = false
+    applyPersistedTradeDraft(restored.draft)
+    draftPersistenceState.value = 'restored'
+    return true
+  } catch (error) {
+    hasPersistedTradeDraft.value = false
+    autoRestoreSkippedDraft.value = false
+    draftPersistenceState.value = 'error'
+    draftPersistenceError.value = normalizeApiError(error).message
+    return false
+  }
+}
+
+async function persistTradeDraftNow() {
+  if (isEditMode.value || !draftPersistenceReady.value) return
+  refreshDraftPersistencePreference()
+  if (!draftPersistenceEnabled.value) return
+  if (autoRestoreSkippedDraft.value && hasPersistedTradeDraft.value) return
+
+  const payload = buildTradeDraftPayload()
+  const fingerprint = createTradeDraftFingerprint(payload)
+  if (fingerprint === createDraftDefaultFingerprint.value) {
+    if (hasPersistedTradeDraft.value) {
+      await clearTradeFormDraft()
+    }
+    hasPersistedTradeDraft.value = false
+    autoRestoreSkippedDraft.value = false
+    draftPersistenceSavedAt.value = null
+    draftPersistenceError.value = ''
+    draftPersistenceState.value = 'idle'
+    return
+  }
+
+  draftPersistenceState.value = 'saving'
+  draftPersistenceError.value = ''
+  try {
+    draftPersistenceSavedAt.value = await writeTradeFormDraft(payload)
+    hasPersistedTradeDraft.value = true
+    autoRestoreSkippedDraft.value = false
+    draftPersistenceState.value = 'saved'
+  } catch (error) {
+    draftPersistenceState.value = 'error'
+    draftPersistenceError.value = normalizeApiError(error).message
+  }
+}
+
+function scheduleTradeDraftPersistence() {
+  if (isEditMode.value || !draftPersistenceReady.value) return
+  if (autoRestoreSkippedDraft.value && hasPersistedTradeDraft.value) return
+  clearDraftPersistenceTimer()
+  draftPersistenceTimer = setTimeout(() => {
+    void persistTradeDraftNow()
+  }, 500)
+}
+
+async function clearPersistedTradeDraftState() {
+  clearDraftPersistenceTimer()
+  await clearTradeFormDraft()
+  hasPersistedTradeDraft.value = false
+  autoRestoreSkippedDraft.value = false
+  draftPersistenceSavedAt.value = null
+  draftPersistenceError.value = ''
+  draftPersistenceState.value = draftPersistenceEnabled.value ? 'idle' : 'disabled'
+}
+
+async function restorePersistedTradeDraftManually() {
+  if (!canRestorePersistedDraft.value) return
+  const restored = await maybeRestorePersistedTradeDraft(false)
+  if (restored) {
+    uiStore.toast({
+      type: 'success',
+      title: 'Local draft restored',
+      message: 'The saved in-progress execution draft has been restored on this page.',
+    })
+  }
+}
+
+async function discardPersistedTradeDraft() {
+  const confirmed = await uiStore.askConfirmation({
+    title: 'Discard local trade draft?',
+    message: 'This removes the locally persisted in-progress trade draft and resets this page to fresh defaults.',
+    confirmText: 'Discard draft',
+    danger: true,
+  })
+  if (!confirmed) return
+
+  await clearPersistedTradeDraftState()
+  await applyCreateDefaultsForCurrentRoute(true)
 }
 
 function setFormFromTrade(trade: Trade, legs: TradeLeg[] = [], tradePsychology?: TradePsychology | null) {
@@ -802,16 +1257,7 @@ function findInstrumentById(value: string): Instrument | null {
 
 const formErrors = computed<Record<string, string>>(() => {
   const errors: Record<string, string> = {}
-  const closeDate = parseLocalDateTime(form.date)
-  const now = Date.now()
-
-  const entry = toNumber(form.entry_price)
-  const stop = toNumber(form.stop_loss)
-  const take = toNumber(form.take_profit)
-  const positionSize = toNumber(form.position_size)
-  const commission = toNumber(form.commission)
-  const spreadCost = toNumber(form.spread_cost)
-  const slippageCost = toNumber(form.slippage_cost)
+  const instrument = selectedInstrument.value
 
   if (!form.account_id) {
     errors.account_id = 'Account is required.'
@@ -863,81 +1309,34 @@ const formErrors = computed<Record<string, string>>(() => {
     errors.session_enum = 'Session is required.'
   }
 
-  if (closeDate === null) {
-    errors.date = 'Close date is required.'
-  } else if (closeDate > now + 60_000) {
-    errors.date = 'Close date cannot be in the future.'
-  }
-
-  if (!(entry > 0)) errors.entry_price = 'Entry price must be greater than 0.'
-  if (!(stop > 0)) errors.stop_loss = 'Stop loss must be greater than 0.'
-  if (!(take > 0)) errors.take_profit = 'Take profit must be greater than 0.'
-  if (!(positionSize >= 0.0001)) errors.position_size = 'Position size must be at least 0.0001.'
-  if (commission < 0) errors.commission = 'Commission cannot be negative.'
-  if (spreadCost < 0) errors.spread_cost = 'Spread cost cannot be negative.'
-  if (slippageCost < 0) errors.slippage_cost = 'Slippage cost cannot be negative.'
-  if (!tradeCompleted.value) errors.trade_completed = 'Mark trade as completed to log this execution.'
-
-  if (tradeCompleted.value) {
-    const primaryPrice = toNumber(primaryExit.price)
-    const primaryQty = toNumber(primaryExit.quantity_lots)
-    const primaryDate = parseLocalDateTime(primaryExit.executed_at)
-
-    if (!(primaryPrice > 0)) {
-      errors.exit_price = 'Exit price must be greater than 0.'
-    }
-    if (!(primaryQty > 0)) {
-      errors.exit_quantity = 'Exit size must be greater than 0.'
-    }
-    if (primaryDate === null) {
-      errors.exit_time = 'Exit date/time is required.'
-    } else if (primaryDate > now + 60_000) {
-      errors.exit_time = 'Exit date/time cannot be in the future.'
-    }
-
-    let exitQuantity = primaryQty
-    for (let index = 0; index < exitLegs.value.length; index += 1) {
-      const leg = exitLegs.value[index]!
-      const price = toNumber(leg.price)
-      const quantity = toNumber(leg.quantity_lots)
-      const legDate = parseLocalDateTime(leg.executed_at)
-
-      if (!(price > 0)) {
-        errors[`legs.${index}.price`] = `Partial exit ${index + 1} price must be greater than 0.`
+  Object.assign(errors, validateTradeIntegrity({
+    date: form.date,
+    direction: form.direction,
+    entry_price: toNumber(form.entry_price),
+    stop_loss: toNumber(form.stop_loss),
+    take_profit: toNumber(form.take_profit),
+    position_size: toNumber(form.position_size),
+    commission: toNumber(form.commission),
+    spread_cost: toNumber(form.spread_cost),
+    slippage_cost: toNumber(form.slippage_cost),
+    trade_completed: tradeCompleted.value,
+    primary_exit: {
+      price: toNumber(primaryExit.price),
+      quantity_lots: toNumber(primaryExit.quantity_lots),
+      executed_at: primaryExit.executed_at,
+    },
+    exit_legs: exitLegs.value.map((leg) => ({
+      price: toNumber(leg.price),
+      quantity_lots: toNumber(leg.quantity_lots),
+      executed_at: leg.executed_at,
+    })),
+    instrument: instrument
+      ? {
+        min_lot: instrument.min_lot,
+        lot_step: instrument.lot_step,
       }
-      if (!(quantity > 0)) {
-        errors[`legs.${index}.quantity_lots`] = `Partial exit ${index + 1} size must be greater than 0.`
-      }
-      if (legDate === null) {
-        errors[`legs.${index}.executed_at`] = `Partial exit ${index + 1} time is required.`
-      } else if (legDate > now + 60_000) {
-        errors[`legs.${index}.executed_at`] = `Partial exit ${index + 1} time cannot be in the future.`
-      }
-
-      exitQuantity += quantity
-    }
-
-    if (positionSize > 0 && exitQuantity > (positionSize + 0.0001)) {
-      errors.legs = 'Total exit size cannot exceed position size.'
-    }
-  }
-
-  if (entry > 0 && stop > 0 && entry === stop) {
-    errors.stop_loss = 'Stop loss must differ from entry price.'
-  }
-  if (entry > 0 && take > 0 && entry === take) {
-    errors.take_profit = 'Take profit must differ from entry price.'
-  }
-
-  if (entry > 0 && stop > 0 && take > 0) {
-    if (form.direction === 'buy') {
-      if (stop >= entry) errors.stop_loss = 'For buy trades, stop loss must be below entry.'
-      if (take <= entry) errors.take_profit = 'For buy trades, take profit must be above entry.'
-    } else {
-      if (stop <= entry) errors.stop_loss = 'For sell trades, stop loss must be above entry.'
-      if (take >= entry) errors.take_profit = 'For sell trades, take profit must be below entry.'
-    }
-  }
+      : null,
+  }))
 
   return errors
 })
@@ -949,12 +1348,47 @@ function fieldError(name: string) {
   return serverFieldErrors.value[name]?.[0] ?? ''
 }
 
-function extractErrorMessage(error: unknown): string {
-  return normalizeApiError(error).message
+async function applyCreateDefaultsForCurrentRoute(skipDraftRestore = false) {
+  draftPersistenceReady.value = false
+  refreshDraftPersistencePreference()
+  resetTradeFormState()
+  await applySmartDefaultsFromLastTrade()
+
+  if (!form.account_id && accountSelectOptions.value.length > 0) {
+    form.account_id = accountSelectOptions.value[0]?.value ?? ''
+  }
+  if (!form.instrument_id && instruments.value.length > 0) {
+    form.instrument_id = String(instruments.value[0]?.id ?? '')
+  }
+  if (!form.strategy_model_id && strategyModelOptions.value.length > 0) {
+    form.strategy_model_id = strategyModelOptions.value[0]?.value ?? ''
+  }
+  if (!form.setup_id && setupOptions.value.length > 0) {
+    form.setup_id = setupOptions.value[0]?.value ?? ''
+  }
+  if (!form.killzone_id && killzoneOptions.value.length > 0) {
+    form.killzone_id = killzoneOptions.value[0]?.value ?? ''
+  }
+  if (!form.session_enum && sessionEnumOptions.value.length > 0) {
+    form.session_enum = (sessionEnumOptions.value[0]?.value as SessionEnum | undefined) ?? ''
+  }
+
+  applyQuickDefaultsFromQuery()
+  createDraftDefaultFingerprint.value = createTradeDraftFingerprint(buildTradeDraftPayload())
+  if (!skipDraftRestore) {
+    await maybeRestorePersistedTradeDraft(isQuickTradeQueryActive())
+  }
+  if (!form.instrument_id && form.symbol.trim()) {
+    selectInstrumentBySymbol(form.symbol)
+  }
+  if (!primaryExit.executed_at) {
+    ensureDefaultExitLeg()
+  }
+  draftPersistenceReady.value = true
 }
 
-function extractFailingRuleIds(error: unknown): number[] {
-  return normalizeApiError(error).failingRuleIds
+function extractErrorMessage(error: unknown): string {
+  return normalizeApiError(error).message
 }
 
 function isTradeRevisionConflict(error: unknown): boolean {
@@ -994,7 +1428,7 @@ function buildPayload(): TradePayload {
     throw new Error('Trade must be marked complete before saving.')
   }
 
-  const closeDate = parseLocalDateTime(form.date)
+  const closeDate = parseTradeDateTime(form.date)
   if (closeDate === null) {
     throw new Error('Close date is invalid.')
   }
@@ -1063,12 +1497,12 @@ function buildPayload(): TradePayload {
       leg_type: 'exit' as const,
       price: Number(primaryExit.price),
       quantity_lots: Number(primaryExit.quantity_lots),
-      executed_at: new Date(parseLocalDateTime(primaryExit.executed_at) ?? closeDate).toISOString(),
+      executed_at: new Date(parseTradeDateTime(primaryExit.executed_at) ?? closeDate).toISOString(),
       fees: Number(primaryExit.fees || 0),
       notes: primaryExit.notes.trim() ? primaryExit.notes.trim() : null,
     },
     ...exitLegs.value.map((leg) => {
-      const executedAt = parseLocalDateTime(leg.executed_at)
+      const executedAt = parseTradeDateTime(leg.executed_at)
       return {
         leg_type: 'exit' as const,
         price: Number(leg.price),
@@ -1116,16 +1550,16 @@ function buildPayload(): TradePayload {
     spread_cost: Number(form.spread_cost || 0),
     slippage_cost: Number(form.slippage_cost || 0),
     legs,
-    followed_rules: form.followed_rules,
+    followed_rules: derivedFollowedRules.value,
     checklist_responses: checklistItems.value.map((item) => ({
       checklist_item_id: item.id,
       value: item.response.value,
     })),
     checklist_evaluation: {
-      status: checklistReadiness.value.status,
-      ready: checklistReadiness.value.ready,
-      completed_required: checklistReadiness.value.completed_required,
-      total_required: checklistReadiness.value.total_required,
+      status: resolvedChecklistReadiness.value.status,
+      ready: resolvedChecklistReadiness.value.ready,
+      completed_required: resolvedChecklistReadiness.value.completed_required,
+      total_required: resolvedChecklistReadiness.value.total_required,
     },
     checklist_incomplete: checklistGateIncomplete.value,
     emotion: form.emotion,
@@ -1233,19 +1667,43 @@ function refreshDerivedState() {
   }, 180)
 }
 
+function setImageUploadStatus(
+  state: ImageUploadStatus['state'],
+  message = '',
+  details: string[] = [],
+  canRetry = false
+) {
+  imageUploadStatus.value = createUploadStatus(state, message, details, canRetry)
+}
+
 function clearPendingImages() {
   for (const image of pendingImages.value) {
-    URL.revokeObjectURL(image.preview_url)
+    revokePendingImagePreview(image)
   }
   pendingImages.value = []
   uploadProgressByPendingId.value = {}
+  if (imageUploadStatus.value.state !== 'uploading') {
+    imageUploadStatus.value = createIdleUploadStatus()
+  }
+}
+
+function detachPendingImage(id: string): PendingTradeImage | null {
+  const index = pendingImages.value.findIndex((image) => image.id === id)
+  if (index < 0) return null
+  const [removed] = pendingImages.value.splice(index, 1)
+  if (!removed) return null
+  revokePendingImagePreview(removed)
+  uploadProgressByPendingId.value = removeUploadProgressEntry(uploadProgressByPendingId.value, removed.id)
+  return removed
 }
 
 function removePendingImage(id: string) {
-  const index = pendingImages.value.findIndex((image) => image.id === id)
-  if (index < 0) return
-  URL.revokeObjectURL(pendingImages.value[index]!.preview_url)
-  pendingImages.value.splice(index, 1)
+  const removed = detachPendingImage(id)
+  if (!removed) return
+
+  if (pendingImages.value.length === 0 && imageUploadStatus.value.canRetry) {
+    imageUploadStatus.value = createIdleUploadStatus()
+  }
 }
 
 async function removeExistingImage(imageId: number) {
@@ -1278,72 +1736,56 @@ function reorderPendingImages(payload: { from: number; to: number }) {
 }
 
 async function onSelectImageFiles(files: File[]) {
-  imageUploadError.value = ''
   if (files.length === 0) return
 
-  const availableSlots = MAX_IMAGE_COUNT - totalImageCount.value
-  if (availableSlots <= 0) {
-    imageUploadError.value = 'Maximum 5 images per trade allowed.'
-    return
-  }
+  setImageUploadStatus('validating', 'Validating screenshots...')
 
-  const selected = files.slice(0, availableSlots)
-  const queued: PendingTradeImage[] = []
-
-  for (const file of selected) {
-    if (!allowedImageTypes.has(file.type)) {
-      imageUploadError.value = 'Only jpg, jpeg, png, webp, and bmp files are allowed.'
-      continue
-    }
-
-    if (file.size > MAX_IMAGE_SIZE_BYTES) {
-      imageUploadError.value = 'Each image must be 5MB or smaller.'
-      continue
-    }
-
-    const compressed = await compressImage(file)
-    if (compressed.size > MAX_IMAGE_SIZE_BYTES) {
-      imageUploadError.value = 'Compressed image still exceeds 5MB. Use a smaller image.'
-      continue
-    }
-
-    const previewUrl = URL.createObjectURL(compressed)
-    queued.push({
+  const result = await preparePendingImages(files, {
+    entityLabel: 'trade',
+    currentCount: totalImageCount.value,
+    currentTotalBytes: totalImageSize.value,
+    maxFiles: MAX_IMAGE_COUNT,
+    maxFileBytes: MAX_IMAGE_SIZE_BYTES,
+    maxTotalBytes: MAX_TOTAL_IMAGE_BYTES,
+    allowedTypes: DEFAULT_ALLOWED_IMAGE_TYPES,
+    buildPendingImage: ({ file, previewUrl }) => ({
       id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
-      file: compressed,
+      file,
       preview_url: previewUrl,
       context_tag: 'entry',
       timeframe: '',
       annotation_notes: '',
-    })
+    }),
+  })
+
+  if (result.accepted.length > 0) {
+    pendingImages.value = [...pendingImages.value, ...result.accepted]
   }
 
-  if (queued.length === 0) return
-
-  const queuedBytes = queued.reduce((sum, image) => sum + image.file.size, 0)
-  if ((totalImageSize.value + queuedBytes) > MAX_TOTAL_IMAGE_BYTES) {
-    for (const image of queued) {
-      URL.revokeObjectURL(image.preview_url)
-    }
-    imageUploadError.value = 'Total image uploads per trade cannot exceed 20MB.'
+  if (result.errors.length > 0) {
+    setImageUploadStatus('error', result.errors[0] ?? 'Some screenshots could not be added.', result.errors)
     return
   }
 
-  pendingImages.value = [...pendingImages.value, ...queued]
+  const count = result.accepted.length
+  setImageUploadStatus(
+    'success',
+    `${count} screenshot${count === 1 ? '' : 's'} ready to upload.`
+  )
 }
 
 async function uploadPendingImages(tradeId: number) {
   if (pendingImages.value.length === 0) return
-
-  uploadingImages.value = true
-  imageUploadError.value = ''
+  const initialCount = pendingImages.value.length
+  let uploadedCount = 0
+  setImageUploadStatus(
+    'uploading',
+    `Uploading ${initialCount} screenshot${initialCount === 1 ? '' : 's'}...`
+  )
 
   try {
-    const baseSort = existingImages.value.length
-    const uploadedImages: TradeImage[] = []
-
-    for (let index = 0; index < pendingImages.value.length; index += 1) {
-      const image = pendingImages.value[index]!
+    while (pendingImages.value.length > 0) {
+      const image = pendingImages.value[0]!
       uploadProgressByPendingId.value = {
         ...uploadProgressByPendingId.value,
         [image.id]: 0,
@@ -1352,7 +1794,7 @@ async function uploadPendingImages(tradeId: number) {
       const uploaded = await tradeStore.uploadTradeImage(
         tradeId,
         image.file,
-        baseSort + index,
+        existingImages.value.length,
         {
           context_tag: image.context_tag,
           timeframe: image.timeframe || null,
@@ -1366,17 +1808,22 @@ async function uploadPendingImages(tradeId: number) {
         }
       )
 
-      uploadedImages.push(uploaded)
+      existingImages.value = [...existingImages.value, uploaded]
+        .sort((a, b) => a.sort_order - b.sort_order || a.id - b.id)
+      uploadedCount += 1
+      detachPendingImage(image.id)
     }
 
-    existingImages.value = [...existingImages.value, ...uploadedImages]
-      .sort((a, b) => a.sort_order - b.sort_order || a.id - b.id)
-    clearPendingImages()
+    setImageUploadStatus(
+      'success',
+      `Uploaded ${uploadedCount} screenshot${uploadedCount === 1 ? '' : 's'}.`
+    )
   } catch (error) {
-    imageUploadError.value = extractErrorMessage(error)
+    const details = uploadedCount > 0
+      ? [`${uploadedCount} screenshot${uploadedCount === 1 ? '' : 's'} already uploaded. Retry the remaining files.`]
+      : []
+    setImageUploadStatus('error', extractErrorMessage(error), details, pendingImages.value.length > 0)
     throw error
-  } finally {
-    uploadingImages.value = false
   }
 }
 
@@ -1422,6 +1869,15 @@ async function runPostSaveStages(tradeId: number) {
   }
 }
 
+async function refreshLoadedTradeSnapshot(tradeId: number): Promise<string | null> {
+  try {
+    const latest = await tradeStore.fetchTradeDetails(tradeId)
+    return normalizeUpdatedAt(latest.trade.updated_at)
+  } catch {
+    return null
+  }
+}
+
 async function retryPostSave() {
   const tradeIdToResume = postSaveQueue.lastSavedTradeId
   if (tradeIdToResume === null || !hasPendingPostSave.value) return
@@ -1435,6 +1891,9 @@ async function retryPostSave() {
       title: 'Post-save sync completed',
       message: 'Psychology and image uploads have been completed.',
     })
+    if (isEditMode.value && tradeId.value === tradeIdToResume) {
+      loadedTradeUpdatedAt.value = await refreshLoadedTradeSnapshot(tradeIdToResume)
+    }
     tradeChecklistStore.clearSubmitAttempted()
     void router.push('/trades')
   } catch (error) {
@@ -1446,6 +1905,10 @@ async function retryPostSave() {
       message: `Trade #${tradeIdToResume} is already saved. Retry post-save to finish psychology/images.`,
     })
   }
+}
+
+function retryImageUploads() {
+  void retryPostSave()
 }
 
 function setupEditLock() {
@@ -1638,9 +2101,7 @@ async function reloadTradeFromLatest() {
 
   clearPendingImages()
   clearStaleWriteWarning()
-  await loadTradeIfNeeded()
-  await loadChecklistState()
-  refreshDerivedState()
+  await hydrateTradeRouteState()
 }
 
 function handleGlobalHotkeys(event: KeyboardEvent) {
@@ -1651,6 +2112,10 @@ function handleGlobalHotkeys(event: KeyboardEvent) {
     event.preventDefault()
     handleExecuteClick()
   }
+}
+
+function runSyncQueueNow() {
+  void syncStatusStore.syncQueueNow()
 }
 
 async function submitForm() {
@@ -1705,11 +2170,14 @@ async function submitForm() {
     const hadPendingImages = pendingImages.value.length > 0
     let savedTradeId: number
     let savedTradeUpdatedAt: string | null = null
+    let savedTradeSyncStatus: string | null = null
 
     if (isEditMode.value && tradeId.value !== null) {
       const savedTrade = await tradeStore.updateTrade(tradeId.value, payload)
       savedTradeId = savedTrade.id
       savedTradeUpdatedAt = normalizeUpdatedAt(savedTrade.updated_at)
+      savedTradeSyncStatus = savedTrade.local_sync_status ?? 'synced'
+      postSaveQueue.lastSavedTradeId = savedTradeId
       markPostSaveQueuePending()
     } else {
       if (postSaveQueue.lastSavedTradeId !== null) {
@@ -1718,6 +2186,7 @@ async function submitForm() {
         const savedTrade = await tradeStore.addTrade(payload)
         savedTradeId = savedTrade.id
         savedTradeUpdatedAt = normalizeUpdatedAt(savedTrade.updated_at)
+        savedTradeSyncStatus = savedTrade.local_sync_status ?? 'synced'
         postSaveQueue.lastSavedTradeId = savedTradeId
       }
       markPostSaveQueuePending()
@@ -1725,19 +2194,32 @@ async function submitForm() {
 
     await runPostSaveStages(savedTradeId)
 
+    if (isEditMode.value) {
+      savedTradeUpdatedAt = await refreshLoadedTradeSnapshot(savedTradeId) ?? savedTradeUpdatedAt
+    }
+
     if (savedTradeUpdatedAt !== null) {
       loadedTradeUpdatedAt.value = savedTradeUpdatedAt
     }
     clearPostSaveQueue()
     clearStaleWriteWarning()
     serverFieldErrors.value = {}
+    if (!isEditMode.value) {
+      await clearPersistedTradeDraftState()
+    }
 
     uiStore.toast({
-      type: 'success',
-      title: isEditMode.value ? 'Execution updated' : 'Execution logged',
-      message: hadPendingImages
-        ? `${payload.symbol} saved with images.`
-        : `${payload.symbol} has been saved to your execution journal.`,
+      type: savedTradeSyncStatus === 'synced' ? 'success' : 'info',
+      title: savedTradeSyncStatus === 'synced'
+        ? (isEditMode.value ? 'Execution updated' : 'Execution logged')
+        : 'Saved as offline draft',
+      message: savedTradeSyncStatus === 'synced'
+        ? (
+          hadPendingImages
+            ? `${payload.symbol} saved with images.`
+            : `${payload.symbol} has been saved to your execution journal.`
+        )
+        : `${payload.symbol} is stored locally on this device and will sync when connectivity is stable.`,
     })
 
     tradeChecklistStore.clearSubmitAttempted()
@@ -1746,10 +2228,10 @@ async function submitForm() {
     const normalized = normalizeApiError(error)
     applyServerFieldErrors(normalized)
 
-    if (!isEditMode.value && postSaveQueue.lastSavedTradeId !== null && hasPendingPostSave.value) {
+    if (postSaveQueue.lastSavedTradeId !== null && hasPendingPostSave.value) {
       uiStore.toast({
         type: 'info',
-        title: 'Trade saved partially',
+        title: isEditMode.value ? 'Execution updated partially' : 'Trade saved partially',
         message: `Trade #${postSaveQueue.lastSavedTradeId} is saved. Retry post-save to finish psychology/images.`,
       })
       return
@@ -1757,20 +2239,13 @@ async function submitForm() {
 
     if (isTradeRevisionConflict(error) && isEditMode.value && tradeId.value !== null) {
       clearPendingImages()
-      await loadTradeIfNeeded()
-      await loadChecklistState()
-      refreshDerivedState()
+      await hydrateTradeRouteState()
       uiStore.toast({
         type: 'info',
         title: 'Trade updated elsewhere',
         message: 'This trade was updated elsewhere. Reloaded latest version.',
       })
       return
-    }
-
-    const failingRuleIds = extractFailingRuleIds(error)
-    if (failingRuleIds.length > 0) {
-      failedRequiredRuleIds.value = failingRuleIds
     }
 
     uiStore.toast({
@@ -1791,22 +2266,30 @@ function handleExecuteClick() {
 }
 
 async function loadTradeIfNeeded() {
-  if (!isEditMode.value || tradeId.value === null) {
-    tradeCompleted.value = true
-    loadedTradeUpdatedAt.value = null
-    clearStaleWriteWarning()
-    serverFieldErrors.value = {}
-    form.date = nowLocalDateTime()
-    ensureDefaultExitLeg()
-    setPsychologyFromPayload(null)
-    clearPostSaveQueue()
+  const requestedTradeId = tradeId.value
+  const requestId = ++tradeHydrationRequestId
+  refreshDraftPersistencePreference()
+  draftPersistenceReady.value = false
+  clearDraftPersistenceTimer()
+
+  if (requestedTradeId === null) {
+    loadingTrade.value = false
+    await applyCreateDefaultsForCurrentRoute()
     return
   }
 
   tradeCompleted.value = true
   loadingTrade.value = true
+  existingImages.value = []
+  deletingImageIds.value = []
+  clearPostSaveQueue()
+  clearStaleWriteWarning()
+  serverFieldErrors.value = {}
   try {
-    const data = await tradeStore.fetchTradeDetails(tradeId.value)
+    const data = await tradeStore.fetchTradeDetails(requestedTradeId)
+    if (!shouldApplyTradeHydration(requestedTradeId, tradeId.value, requestId, tradeHydrationRequestId)) {
+      return
+    }
     loadedTradeUpdatedAt.value = normalizeUpdatedAt(data.trade.updated_at)
     clearStaleWriteWarning()
     serverFieldErrors.value = {}
@@ -1816,6 +2299,9 @@ async function loadTradeIfNeeded() {
       .slice()
       .sort((a, b) => a.sort_order - b.sort_order || a.id - b.id)
   } catch {
+    if (!shouldApplyTradeHydration(requestedTradeId, tradeId.value, requestId, tradeHydrationRequestId)) {
+      return
+    }
     uiStore.toast({
       type: 'error',
       title: 'Execution not found',
@@ -1823,7 +2309,9 @@ async function loadTradeIfNeeded() {
     })
     void router.push('/trades')
   } finally {
-    loadingTrade.value = false
+    if (shouldApplyTradeHydration(requestedTradeId, tradeId.value, requestId, tradeHydrationRequestId)) {
+      loadingTrade.value = false
+    }
   }
 }
 
@@ -1840,18 +2328,24 @@ async function loadChecklistState() {
   refreshDerivedState()
 }
 
+async function hydrateTradeRouteState() {
+  setupEditLock()
+  await loadTradeIfNeeded()
+  await loadChecklistState()
+  refreshDerivedState()
+}
+
 function onChecklistResponseChange(itemId: number, value: unknown) {
   tradeChecklistStore.updateResponse(itemId, value, false)
   refreshDerivedState()
 }
 
-function onChecklistEvaluationChange(payload: { failedRequiredIds: number[]; firstFailingId: number | null }) {
-  failedRequiredRuleIds.value = payload.failedRequiredIds
+function onChecklistEvaluationChange(_: { failedRequiredIds: number[]; firstFailingId: number | null }) {
 }
 
 onMounted(async () => {
   window.addEventListener('keydown', handleGlobalHotkeys)
-  setupEditLock()
+  refreshDraftPersistencePreference()
 
   try {
     await Promise.all([
@@ -1868,44 +2362,14 @@ onMounted(async () => {
     })
   }
 
-  await applySmartDefaultsFromLastTrade()
-
-  if (!isEditMode.value && !form.account_id && accountSelectOptions.value.length > 0) {
-    form.account_id = accountSelectOptions.value[0]?.value ?? ''
-  }
-  if (!isEditMode.value && !form.instrument_id && instruments.value.length > 0) {
-    form.instrument_id = String(instruments.value[0]?.id ?? '')
-  }
-  if (!isEditMode.value && !form.strategy_model_id && strategyModelOptions.value.length > 0) {
-    form.strategy_model_id = strategyModelOptions.value[0]?.value ?? ''
-  }
-  if (!isEditMode.value && !form.setup_id && setupOptions.value.length > 0) {
-    form.setup_id = setupOptions.value[0]?.value ?? ''
-  }
-  if (!isEditMode.value && !form.killzone_id && killzoneOptions.value.length > 0) {
-    form.killzone_id = killzoneOptions.value[0]?.value ?? ''
-  }
-  if (!isEditMode.value && !form.session_enum && sessionEnumOptions.value.length > 0) {
-    form.session_enum = (sessionEnumOptions.value[0]?.value as SessionEnum | undefined) ?? ''
-  }
-
-  applyQuickDefaultsFromQuery()
-  await loadTradeIfNeeded()
-  if (!form.instrument_id && form.symbol.trim()) {
-    selectInstrumentBySymbol(form.symbol)
-  }
-  await loadChecklistState()
-  refreshDerivedState()
+  await hydrateTradeRouteState()
 })
 
 watch(
   () => tradeId.value,
   (next, previous) => {
     if (next === previous) return
-    setupEditLock()
-    void loadTradeIfNeeded()
-    void loadChecklistState()
-    refreshDerivedState()
+    void hydrateTradeRouteState()
   }
 )
 
@@ -2027,7 +2491,25 @@ watch(
   }
 )
 
+watch(
+  () => tradeDraftFingerprint.value,
+  () => {
+    scheduleTradeDraftPersistence()
+  }
+)
+
+watch(
+  () => browserOnline.value,
+  () => {
+    refreshDraftPersistencePreference()
+  }
+)
+
 onBeforeUnmount(() => {
+  if (!isEditMode.value && draftPersistenceEnabled.value && hasMeaningfulDraftChanges.value) {
+    void persistTradeDraftNow()
+  }
+  clearDraftPersistenceTimer()
   window.removeEventListener('keydown', handleGlobalHotkeys)
   teardownEditLock()
   clearChecklistPreviewTimer()
@@ -2043,63 +2525,6 @@ onBeforeUnmount(() => {
   }
 })
 
-async function compressImage(file: File): Promise<File> {
-  try {
-    const image = await loadImage(file)
-    const maxDimension = 1920
-    const ratio = Math.min(1, maxDimension / Math.max(image.width, image.height))
-    const targetWidth = Math.max(1, Math.round(image.width * ratio))
-    const targetHeight = Math.max(1, Math.round(image.height * ratio))
-
-    const canvas = document.createElement('canvas')
-    canvas.width = targetWidth
-    canvas.height = targetHeight
-
-    const context = canvas.getContext('2d')
-    if (!context) return file
-
-    context.drawImage(image, 0, 0, targetWidth, targetHeight)
-
-    const outputType = file.type === 'image/webp' ? 'image/webp' : 'image/jpeg'
-    const blob = await new Promise<Blob | null>((resolve) => {
-      canvas.toBlob(resolve, outputType, 0.82)
-    })
-
-    if (!blob) return file
-    if (blob.size >= file.size) return file
-
-    const normalizedName = normalizeFileName(file.name, outputType)
-    return new File([blob], normalizedName, {
-      type: outputType,
-      lastModified: Date.now(),
-    })
-  } catch {
-    return file
-  }
-}
-
-function normalizeFileName(name: string, mimeType: string) {
-  const base = name.replace(/\.[^/.]+$/, '')
-  const ext = mimeType === 'image/webp' ? 'webp' : 'jpg'
-  return `${base}.${ext}`
-}
-
-async function loadImage(file: File): Promise<HTMLImageElement> {
-  const url = URL.createObjectURL(file)
-
-  return await new Promise((resolve, reject) => {
-    const image = new Image()
-    image.onload = () => {
-      URL.revokeObjectURL(url)
-      resolve(image)
-    }
-    image.onerror = () => {
-      URL.revokeObjectURL(url)
-      reject(new Error('Unable to load image'))
-    }
-    image.src = url
-  })
-}
 </script>
 
 <template>
@@ -2124,6 +2549,40 @@ async function loadImage(file: File): Promise<HTMLImageElement> {
             <ArrowLeft class="h-4 w-4" />
             Back
           </button>
+        </div>
+
+        <div v-if="showTradeDraftBanner" class="panel p-3 text-sm">
+          <p class="font-semibold">{{ tradeDraftBannerTitle }}</p>
+          <p class="mt-1">{{ tradeDraftBannerMessage }}</p>
+          <p class="mt-2 text-[var(--muted)]">{{ tradeDraftStatusMessage }}</p>
+          <p v-if="lastSyncError" class="field-error-text mt-2">{{ lastSyncError }}</p>
+          <div class="mt-3 flex flex-wrap gap-2">
+            <button
+              v-if="canRestorePersistedDraft"
+              type="button"
+              class="btn btn-secondary px-3 py-1.5 text-sm"
+              @click="restorePersistedTradeDraftManually"
+            >
+              Restore local draft
+            </button>
+            <button
+              v-if="hasPersistedTradeDraft && draftPersistenceEnabled"
+              type="button"
+              class="btn btn-ghost px-3 py-1.5 text-sm"
+              @click="discardPersistedTradeDraft"
+            >
+              Discard local draft
+            </button>
+            <button
+              v-if="browserOnline !== false && (isFallbackMode || pendingQueueCount > 0)"
+              type="button"
+              class="btn btn-ghost px-3 py-1.5 text-sm"
+              :disabled="syncing"
+              @click="runSyncQueueNow"
+            >
+              {{ syncing ? 'Syncing queue...' : 'Sync queued drafts' }}
+            </button>
+          </div>
         </div>
 
         <p v-if="blockedSummary" class="field-error-text">{{ blockedSummary }}</p>
@@ -2507,13 +2966,18 @@ async function loadImage(file: File): Promise<HTMLImageElement> {
           :offline-warning="isFallbackMode"
           :max-files="MAX_IMAGE_COUNT"
           :uploading="uploadingImages"
+          :upload-state="imageUploadStatus.state"
+          :status-message="imageUploadStatus.message"
+          :status-details="imageUploadStatus.details"
+          :retryable="imageUploadRetryable"
+          retry-label="Retry post-save"
           :upload-progress="uploadProgressByPendingId"
           :deleting-image-ids="deletingImageIds"
-          :error="imageUploadError"
           @select-files="onSelectImageFiles"
           @remove-pending="removePendingImage"
           @remove-existing="removeExistingImage"
           @reorder-pending="reorderPendingImages"
+          @retry-upload="retryImageUploads"
         />
 
         <section class="trade-form-section execution-long-section">
@@ -2591,12 +3055,15 @@ async function loadImage(file: File): Promise<HTMLImageElement> {
             <span v-if="postSaveQueue.pendingPsychology"> Psychology pending.</span>
             <span v-if="postSaveQueue.pendingImages"> Images pending.</span>
           </span>
+          <span v-else-if="!isEditMode" class="text-xs muted">
+            {{ tradeDraftStatusMessage }}
+          </span>
           <span v-if="showSoftChecklistNotice" class="text-xs muted">
             Soft mode: rules incomplete, execution allowed.
           </span>
           <button type="button" class="btn btn-ghost px-4 py-2 text-sm" @click="router.push('/trades')">Cancel</button>
           <button
-            v-if="!isEditMode && hasPendingPostSave"
+            v-if="hasPendingPostSave"
             type="button"
             class="btn btn-ghost px-4 py-2 text-sm"
             :disabled="tradeStore.saving || uploadingImages"

@@ -1,5 +1,65 @@
-# Vue 3 + TypeScript + Vite
+# IZLedger Web App
 
-This template should help get you started developing with Vue 3 and TypeScript in Vite. The template uses Vue 3 `<script setup>` SFCs, check out the [script setup docs](https://v3.vuejs.org/api/sfc-script-setup.html#sfc-script-setup) to learn more.
+Frontend for IZLedger, the behavior-first trading journal SaaS for day traders and prop firm traders.
 
-Learn more about the recommended Project Setup and IDE Support in the [Vue Docs TypeScript Guide](https://vuejs.org/guide/typescript/overview.html#project-setup).
+## Requirements
+
+- Node.js 22
+- npm
+
+## Install
+
+```bash
+npm ci
+```
+
+## Local development
+
+```bash
+npm run dev
+```
+
+## Production build
+
+```bash
+npm run build
+```
+
+## Test suites
+
+Unit tests:
+
+```bash
+npm run test
+```
+
+Behavior E2E tests:
+
+```bash
+npx playwright install --with-deps chromium
+npm run test:e2e -- --project=desktop
+```
+
+Visual regression tests:
+
+```bash
+npx playwright install --with-deps chromium
+npm run test:visual -- --project=desktop
+```
+
+Update visual snapshots:
+
+```bash
+npm run test:visual:update -- --project=desktop
+```
+
+## Covered E2E flows
+
+- Auth redirects for protected routes
+- Session refresh persistence and expired-session handling
+- Trade create/edit validation
+- Missed-trade validation and creation
+- Rules CRUD plus trade workflow integration
+- Lot size calculator FX/account-currency scenarios
+- Dashboard filter URL persistence
+- Theme persistence across nested routes

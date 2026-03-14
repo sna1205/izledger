@@ -37,6 +37,7 @@ let syncListenersBound = false
 
 export const useSyncStatusStore = defineStore('sync-status', () => {
   const mode = ref<SyncMode>('server')
+  const browserOnline = ref(typeof navigator === 'undefined' ? true : navigator.onLine !== false)
   const lastFallbackAt = ref<string | null>(null)
   const lastFallbackContext = ref<string | null>(null)
   const lastRecoveredAt = ref<string | null>(null)
@@ -71,9 +72,11 @@ export const useSyncStatusStore = defineStore('sync-status', () => {
     if (typeof window === 'undefined') return
 
     const onOnline = () => {
+      browserOnline.value = true
       void syncQueueNow()
     }
     const onOffline = () => {
+      browserOnline.value = false
       mode.value = 'offline_draft'
     }
 
@@ -202,6 +205,7 @@ export const useSyncStatusStore = defineStore('sync-status', () => {
 
   return {
     mode,
+    browserOnline,
     isFallbackMode,
     lastFallbackAt,
     lastFallbackContext,

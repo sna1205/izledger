@@ -1,6 +1,6 @@
 ﻿<script setup lang="ts">
 import { computed, defineAsyncComponent, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { RouterLink } from 'vue-router'
+import { RouterLink, useRoute, useRouter } from 'vue-router'
 import { storeToRefs } from 'pinia'
 import {
   BarChartHorizontalBig,
@@ -18,16 +18,26 @@ import EmptyState from '@/components/layout/EmptyState.vue'
 import AnimatedNumber from '@/components/layout/AnimatedNumber.vue'
 import DatePopoverField from '@/components/form/DatePopoverField.vue'
 import BaseSelect from '@/components/form/BaseSelect.vue'
+import OnboardingChecklist from '@/components/dashboard/OnboardingChecklist.vue'
 import api from '@/services/api'
 import { dashboardLeaderElection } from '@/services/leaderElection'
 import { queryLocalMissedTrades, queryLocalTrades, shouldUseLocalFallback } from '@/services/localFallback'
+import {
+  buildDashboardQuery,
+  DASHBOARD_ROUTE_QUERY_KEYS,
+  dashboardRouteStatesEqual,
+  parseDashboardQuery,
+  type DashboardRouteState,
+} from '@/utils/dashboardRoute'
 import { asCurrency, asSignedCurrency } from '@/utils/format'
 import { useAccountStore } from '@/stores/accountStore'
 import { useAnalyticsStore } from '@/stores/analyticsStore'
+import { useAuthStore } from '@/stores/authStore'
 import { useReportStore } from '@/stores/reportStore'
 import { useSyncStatusStore } from '@/stores/syncStatusStore'
 import { useTradeStore } from '@/stores/tradeStore'
 import { useUiStore } from '@/stores/uiStore'
+import { useUserPreferencesStore } from '@/stores/userPreferencesStore'
 import {
   isLiveAccountType,
   isPropAccountType,
@@ -49,12 +59,16 @@ type RefreshTrigger = 'mount' | 'filters' | 'focus' | 'interval' | 'saved-view'
 const DASHBOARD_REFRESH_DEBOUNCE_MS = 180
 const DASHBOARD_REFRESH_INTERVAL_MS = 45000
 
+const route = useRoute()
+const router = useRouter()
+const authStore = useAuthStore()
 const analyticsStore = useAnalyticsStore()
 const accountStore = useAccountStore()
 const reportStore = useReportStore()
 const syncStatusStore = useSyncStatusStore()
 const tradeStore = useTradeStore()
 const uiStore = useUiStore()
+const userPreferencesStore = useUserPreferencesStore()
 const {
   summary,
   overview,
@@ -64,6 +78,7 @@ const {
   drawdownSeries,
   rankings,
   behavioral,
+  performanceProfile,
   reportingCurrency,
   fxNormalized,
   loading,
@@ -91,6 +106,7 @@ const recentMissedTradesLoading = ref(false)
 const challengeStatus = ref<AccountChallengeStatusPayload | null>(null)
 const challengeStatusLoading = ref(false)
 const selectedDashboardReportId = ref('')
+const dashboardRouteHydrated = ref(false)
 let recentTradesRefreshHandle: number | null = null
 let dashboardRefreshDebounceHandle: number | null = null
 let dashboardRefreshGeneration = 0
@@ -102,6 +118,8 @@ let inFlightDashboardRefresh: {
   promise: Promise<void>
 } | null = null
 const isLeader = ref(false)
+
+applyDashboardRouteState(parseDashboardQuery(route.query))
 
 const propAccounts = computed(() => accounts.value.filter((account) => isPropAccountType(account.account_type)))
 const liveAccounts = computed(() => accounts.value.filter((account) => isLiveAccountType(account.account_type)))
@@ -325,6 +343,136 @@ const dashboardSavedViewOptions = computed(() => [
     .filter((report) => report.scope === 'dashboard')
     .map((report) => ({ label: report.name, value: String(report.id) })),
 ])
+const profilePreferences = computed(() => userPreferencesStore.preferences)
+const hasCustomizedProfile = computed(() => {
+  const name = authStore.user?.name?.trim() ?? ''
+  const preferences = profilePreferences.value
+
+  if (!name || !preferences) return false
+
+  return preferences.profile_timezone !== 'UTC' || preferences.profile_locale !== 'en-US'
+})
+const hasSessionPreferences = computed(() => accounts.value.length > 0 || selectedAccountId.value !== null)
+const hasLoggedFirstTrade = computed(() => periodTradeCount.value > 0 || recentTrades.value.length > 0)
+const hasTaggedRuleBreak = computed(() => {
+  if (Number(brokeRules.value?.total_trades ?? 0) > 0) {
+    return true
+  }
+
+  return recentTrades.value.some((trade) => trade.followed_rules === false)
+})
+const hasReviewedExecutionScore = computed(() => Number(performanceProfile.value?.consistency_score ?? 0) > 0)
+const onboardingItems = computed(() => [
+  {
+    key: 'profile',
+    title: 'Complete your trader profile',
+    description: 'Set your profile preferences so review timestamps and workspace defaults match how you trade.',
+    completed: hasCustomizedProfile.value,
+    href: '/settings/hub#settings-profile',
+    cta: 'Open profile',
+  },
+  {
+    key: 'session-preferences',
+    title: 'Set session preferences',
+    description: 'Choose the account context you review most often so daily analytics start from the right setup.',
+    completed: hasSessionPreferences.value,
+    href: '/accounts',
+    cta: 'Set preferences',
+  },
+  {
+    key: 'first-trade',
+    title: 'Log your first trade',
+    description: 'Capture one executed trade with context so IZLedger can begin measuring execution quality.',
+    completed: hasLoggedFirstTrade.value,
+    href: '/trades/new',
+    cta: 'Log trade',
+  },
+  {
+    key: 'rule-break',
+    title: 'Tag your first rule break',
+    description: 'Mark the first discipline miss so repeat mistakes become visible during session review.',
+    completed: hasTaggedRuleBreak.value,
+    href: '/trades?focus=rule_breaks',
+    cta: 'Review rule breaks',
+  },
+  {
+    key: 'execution-score',
+    title: 'Review your execution score',
+    description: 'Use the dashboard overview to connect performance, behavior, and consistency in one review loop.',
+    completed: hasReviewedExecutionScore.value,
+    href: '/dashboard',
+    cta: 'Review score',
+  },
+])
+
+function buildCurrentDashboardRouteState(): DashboardRouteState {
+  const sortedCustomRange = sortDateRange(customDateFrom.value, customDateTo.value)
+
+  return {
+    mode: effectiveDashboardMode.value,
+    tab: activeTab.value,
+    rangePreset: rangePreset.value,
+    customDateFrom: rangePreset.value === 'custom' ? (sortedCustomRange.date_from ?? '') : '',
+    customDateTo: rangePreset.value === 'custom' ? (sortedCustomRange.date_to ?? '') : '',
+    accountId: scopedSelectedAccountId.value,
+    includeDraftsUnverified: includeDraftsUnverified.value,
+  }
+}
+
+function applyDashboardRouteState(state: DashboardRouteState) {
+  dashboardMode.value = state.mode
+  activeTab.value = state.tab
+  rangePreset.value = state.rangePreset
+  customDateFrom.value = state.customDateFrom
+  customDateTo.value = state.customDateTo
+  accountStore.setSelectedAccountId(state.accountId)
+  tradeStore.setIncludeDraftsUnverified(state.includeDraftsUnverified)
+}
+
+function routeQueryWithDashboardState(state: DashboardRouteState): Record<string, string> {
+  const preservedEntries = Object.entries(route.query).filter(([key]) =>
+    !DASHBOARD_ROUTE_QUERY_KEYS.includes(key as typeof DASHBOARD_ROUTE_QUERY_KEYS[number])
+  )
+
+  const nextQuery: Record<string, string> = {}
+  for (const [key, value] of preservedEntries) {
+    const normalized = normalizeRouteQueryValue(value)
+    if (normalized !== '') {
+      nextQuery[key] = normalized
+    }
+  }
+
+  return {
+    ...nextQuery,
+    ...buildDashboardQuery(state),
+  }
+}
+
+async function syncDashboardRoute(options?: { replace?: boolean }) {
+  const nextState = buildCurrentDashboardRouteState()
+  const nextQuery = routeQueryWithDashboardState(nextState)
+  const currentQuery = normalizeRouteQueryObject(route.query)
+
+  if (queryObjectsEqual(currentQuery, nextQuery)) {
+    return
+  }
+
+  if (options?.replace) {
+    await router.replace({ query: nextQuery })
+    return
+  }
+
+  await router.push({ query: nextQuery })
+}
+
+function syncSelectedDashboardReport() {
+  const currentFilters = serializedDashboardFilters()
+  const matchedReport = reports.value.find((report) =>
+    report.scope === 'dashboard' && dashboardReportMatchesFilters(report.filters_json ?? {}, currentFilters)
+  )
+
+  selectedDashboardReportId.value = matchedReport ? String(matchedReport.id) : ''
+}
 
 onMounted(async () => {
   tradeStore.refreshTradeQualityPreference()
@@ -340,8 +488,12 @@ onMounted(async () => {
   })
   window.addEventListener('online', handleOnlineStatusChange)
   window.addEventListener('offline', handleOnlineStatusChange)
+  applyDashboardRouteState(parseDashboardQuery(route.query))
   await accountStore.fetchAccounts()
   await loadDashboardSavedViews()
+  await syncDashboardRoute({ replace: true })
+  dashboardRouteHydrated.value = true
+  syncSelectedDashboardReport()
   await runDashboardRefresh('mount')
   ensureDashboardPollingState()
   window.addEventListener('focus', handleVisibilityOrFocus)
@@ -364,13 +516,33 @@ watch(
   [
     () => scopedSelectedAccountId.value,
     () => effectiveDashboardMode.value,
+    () => activeTab.value,
     () => rangePreset.value,
     () => customDateFrom.value,
     () => customDateTo.value,
     () => includeDraftsUnverified.value,
   ],
   () => {
+    if (!dashboardRouteHydrated.value) return
+    syncSelectedDashboardReport()
+    void syncDashboardRoute()
     scheduleDashboardRefresh('filters')
+  }
+)
+
+watch(
+  () => route.query,
+  (query) => {
+    const nextState = parseDashboardQuery(query)
+    const currentState = buildCurrentDashboardRouteState()
+
+    if (!dashboardRouteStatesEqual(nextState, currentState)) {
+      applyDashboardRouteState(nextState)
+    }
+
+    if (dashboardRouteHydrated.value) {
+      syncSelectedDashboardReport()
+    }
   }
 )
 
@@ -379,6 +551,14 @@ watch(
   (tab) => {
     tabMounted.value[tab] = true
   }
+)
+
+watch(
+  () => reports.value,
+  () => {
+    syncSelectedDashboardReport()
+  },
+  { deep: true }
 )
 
 watch(
@@ -501,14 +681,15 @@ async function loadDashboardSavedViews() {
 }
 
 function serializedDashboardFilters() {
+  const current = buildCurrentDashboardRouteState()
   return {
-    mode: effectiveDashboardMode.value,
-    range_preset: rangePreset.value,
-    date_from: customDateFrom.value,
-    date_to: customDateTo.value,
-    account_id: scopedSelectedAccountId.value,
-    tab: activeTab.value,
-    include_drafts_unverified: includeDraftsUnverified.value,
+    mode: current.mode,
+    range_preset: current.rangePreset,
+    date_from: current.customDateFrom,
+    date_to: current.customDateTo,
+    account_id: current.accountId,
+    tab: current.tab,
+    include_drafts_unverified: current.includeDraftsUnverified,
   }
 }
 
@@ -568,8 +749,6 @@ async function applyDashboardSavedView(reportId: string) {
   if (includeDrafts !== '') {
     tradeStore.setIncludeDraftsUnverified(includeDrafts === 'true' || includeDrafts === '1')
   }
-
-  scheduleDashboardRefresh('saved-view')
 }
 
 function exportDashboardCsv() {
@@ -855,6 +1034,69 @@ function sortDateRange(dateFrom: string, dateTo: string) {
     date_from: dateFrom || undefined,
     date_to: dateTo || undefined,
   }
+}
+
+function normalizeRouteQueryValue(value: unknown): string {
+  if (Array.isArray(value)) {
+    return value.length > 0 ? String(value[0] ?? '').trim() : ''
+  }
+
+  if (value === null || value === undefined) {
+    return ''
+  }
+
+  return String(value).trim()
+}
+
+function normalizeRouteQueryObject(query: Record<string, unknown>): Record<string, string> {
+  const normalized: Record<string, string> = {}
+
+  for (const [key, value] of Object.entries(query)) {
+    const nextValue = normalizeRouteQueryValue(value)
+    if (nextValue !== '') {
+      normalized[key] = nextValue
+    }
+  }
+
+  return normalized
+}
+
+function queryObjectsEqual(left: Record<string, string>, right: Record<string, string>): boolean {
+  const leftKeys = Object.keys(left).sort()
+  const rightKeys = Object.keys(right).sort()
+
+  if (leftKeys.length !== rightKeys.length) return false
+
+  return leftKeys.every((key, index) =>
+    key === rightKeys[index] && left[key] === right[key]
+  )
+}
+
+function dashboardReportMatchesFilters(
+  saved: Record<string, unknown>,
+  current: ReturnType<typeof serializedDashboardFilters>
+): boolean {
+  const savedState = {
+    mode: String(saved.mode ?? 'live') === 'prop' ? 'prop' : 'live',
+    range_preset: String(saved.range_preset ?? '30d') === 'custom' ? 'custom' : '30d',
+    date_from: String(saved.date_from ?? ''),
+    date_to: String(saved.date_to ?? ''),
+    account_id: Number(saved.account_id ?? 0) > 0 ? Number(saved.account_id) : null,
+    tab: ['overview', 'chart', 'calendar'].includes(String(saved.tab ?? ''))
+      ? String(saved.tab)
+      : 'overview',
+    include_drafts_unverified: saved.include_drafts_unverified === true
+      || String(saved.include_drafts_unverified ?? '') === 'true'
+      || String(saved.include_drafts_unverified ?? '') === '1',
+  }
+
+  return savedState.mode === current.mode
+    && savedState.range_preset === current.range_preset
+    && savedState.date_from === current.date_from
+    && savedState.date_to === current.date_to
+    && savedState.account_id === current.account_id
+    && savedState.tab === current.tab
+    && savedState.include_drafts_unverified === current.include_drafts_unverified
 }
 
 function toNumber(value: unknown): number {
@@ -1252,6 +1494,8 @@ function setDashboardMode(mode: DashboardMode) {
       </section>
 
       <div v-if="tabMounted.overview" v-show="activeTab === 'overview'" class="overview-sections-stack">
+        <OnboardingChecklist :items="onboardingItems" />
+
         <section v-if="loading && !summary" class="grid grid-premium lg:grid-cols-4">
           <SkeletonBlock v-for="index in 4" :key="`dashboard-kpi-skeleton-${index}`" height-class="h-52" rounded-class="rounded-2xl" />
         </section>

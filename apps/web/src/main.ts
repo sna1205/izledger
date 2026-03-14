@@ -18,6 +18,7 @@ async function bootstrap() {
 
   const authStore = useAuthStore(pinia)
   await authStore.initialize()
+  uiStore.syncThemeFromStorage()
   const userPreferencesStore = useUserPreferencesStore(pinia)
   try {
     await userPreferencesStore.initialize(true)
@@ -26,6 +27,7 @@ async function bootstrap() {
   }
 
   app.use(router)
+  await router.isReady()
   app.mount('#app')
 }
 

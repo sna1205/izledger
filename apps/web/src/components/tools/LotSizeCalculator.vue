@@ -183,6 +183,13 @@ const stopDistanceValue = computed(() =>
     ? calculationResult.value.stop_distance_pips
     : calculationResult.value.stop_distance_ticks
 )
+const showUsdDiagnostics = computed(() =>
+  calculationResult.value.risk_currency !== 'USD'
+  && (
+    calculationResult.value.pip_value_per_lot_usd !== null
+    || calculationResult.value.tick_value_per_lot_usd !== null
+  )
+)
 
 async function refreshFxConversion() {
   const instrument = selectedInstrument.value
@@ -629,6 +636,10 @@ function switchRiskMode(nextMode: RiskMode) {
 
         <div class="lot-calc-secondary">
           <p><span>Risk currency</span><strong>{{ calculationResult.risk_currency }}</strong></p>
+          <p v-if="calculationResult.quote_currency">
+            <span>Quote currency</span>
+            <strong>{{ calculationResult.quote_currency }}</strong>
+          </p>
           <p v-if="calculationResult.quote_currency && calculationResult.quote_currency !== calculationResult.risk_currency">
             <span>FX</span>
             <strong>
@@ -641,12 +652,24 @@ function switchRiskMode(nextMode: RiskMode) {
               }}
             </strong>
           </p>
+          <p v-if="calculationResult.conversion_rate_usd_to_account !== null && calculationResult.risk_currency !== 'USD'">
+            <span>USD -> {{ calculationResult.risk_currency }}</span>
+            <strong>{{ asNumber(calculationResult.conversion_rate_usd_to_account, 6) }}</strong>
+          </p>
           <p><span>Expected Profit @ TP</span><strong>{{ calculationResult.expected_profit_at_tp === null ? '-' : asMoney(calculationResult.expected_profit_at_tp) }}</strong></p>
           <p><span>Risk : Reward</span><strong>{{ calculationResult.rr_ratio === null ? '-' : `${asNumber(calculationResult.rr_ratio, 2)}R` }}</strong></p>
           <p><span>Tick Value ({{ calculationResult.risk_currency }}, 1 lot)</span><strong>{{ calculationResult.tick_value_per_lot_account === null ? '-' : asMoney(calculationResult.tick_value_per_lot_account) }}</strong></p>
           <p v-if="calculationResult.pip_value_per_lot_account !== null">
             <span>Pip Value ({{ calculationResult.risk_currency }}, 1 lot)</span>
             <strong>{{ asMoney(calculationResult.pip_value_per_lot_account) }}</strong>
+          </p>
+          <p v-if="showUsdDiagnostics && calculationResult.tick_value_per_lot_usd !== null">
+            <span>Tick Value (USD, 1 lot)</span>
+            <strong>${{ asNumber(calculationResult.tick_value_per_lot_usd, 2) }}</strong>
+          </p>
+          <p v-if="showUsdDiagnostics && calculationResult.pip_value_per_lot_usd !== null">
+            <span>Pip Value (USD, 1 lot)</span>
+            <strong>${{ asNumber(calculationResult.pip_value_per_lot_usd, 2) }}</strong>
           </p>
           <p><span>Estimated Costs</span><strong>{{ asMoney(calculationResult.estimated_costs) }}</strong></p>
         </div>

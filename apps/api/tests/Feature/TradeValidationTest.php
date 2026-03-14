@@ -81,6 +81,23 @@ class TradeValidationTest extends TestCase
         $response->assertJsonValidationErrors(['stop_loss']);
     }
 
+    public function test_trade_creation_rejects_zero_position_size(): void
+    {
+        $account = $this->createOwnedAccount([
+            'starting_balance' => 10_000,
+            'current_balance' => 10_000,
+            'is_active' => true,
+        ]);
+
+        $response = $this->withTradeIdempotencyKey()->postJson('/api/trades', [
+            ...$this->tradePayload((int) $account->id),
+            'position_size' => 0,
+        ]);
+
+        $response->assertStatus(422);
+        $response->assertJsonValidationErrors(['lot_size']);
+    }
+
     public function test_trade_creation_rejects_sell_take_profit_above_entry(): void
     {
         $account = $this->createOwnedAccount([
@@ -127,6 +144,85 @@ class TradeValidationTest extends TestCase
 
         $response->assertStatus(422);
         $response->assertJsonValidationErrors(['stop_loss']);
+    }
+
+    public function test_trade_update_rejects_future_close_date_on_partial_update(): void
+    {
+        $account = $this->createOwnedAccount([
+            'starting_balance' => 10_000,
+            'current_balance' => 10_000,
+            'is_active' => true,
+        ]);
+
+        $trade = Trade::factory()->create([
+            'account_id' => $account->id,
+            'instrument_id' => $this->eurusdInstrumentId,
+            'pair' => 'EURUSD',
+            'direction' => 'buy',
+            'entry_price' => 1.1000,
+            'stop_loss' => 1.0950,
+            'take_profit' => 1.1200,
+            'actual_exit_price' => 1.1100,
+            'date' => now()->subDay(),
+        ]);
+
+        $response = $this->withHeaders(['If-Match' => '1'])->putJson("/api/trades/{$trade->id}", [
+            'close_date' => now()->addDay()->toIso8601String(),
+        ]);
+
+        $response->assertStatus(422);
+        $response->assertJsonValidationErrors(['date']);
+    }
+
+    public function test_trade_creation_rejects_leg_without_execution_time(): void
+    {
+        $account = $this->createOwnedAccount([
+            'starting_balance' => 10_000,
+            'current_balance' => 10_000,
+            'is_active' => true,
+        ]);
+
+        $payload = $this->tradePayload((int) $account->id);
+        unset($payload['position_size'], $payload['actual_exit_price']);
+
+        $response = $this->withTradeIdempotencyKey()->postJson('/api/trades', [
+            ...$payload,
+            'legs' => [
+                [
+                    'leg_type' => 'entry',
+                    'price' => 1.1000,
+                    'quantity_lots' => 1.0,
+                    'executed_at' => now()->subDay()->toIso8601String(),
+                    'fees' => 0,
+                ],
+                [
+                    'leg_type' => 'exit',
+                    'price' => 1.1010,
+                    'quantity_lots' => 1.0,
+                    'fees' => 0,
+                ],
+            ],
+        ]);
+
+        $response->assertStatus(422);
+        $response->assertJsonValidationErrors(['legs.1.executed_at']);
+    }
+
+    public function test_trade_creation_rejects_invalid_close_date_instead_of_coercing_it(): void
+    {
+        $account = $this->createOwnedAccount([
+            'starting_balance' => 10_000,
+            'current_balance' => 10_000,
+            'is_active' => true,
+        ]);
+
+        $response = $this->withTradeIdempotencyKey()->postJson('/api/trades', [
+            ...$this->tradePayload((int) $account->id),
+            'close_date' => 'not-a-real-date',
+        ]);
+
+        $response->assertStatus(422);
+        $response->assertJsonValidationErrors(['date']);
     }
 
     public function test_trade_risk_validation_endpoint_is_not_available(): void

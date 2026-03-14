@@ -62,6 +62,18 @@ const XAUUSD: LotSizeInstrumentSpec = {
   min_lot: '0.01',
 }
 
+const GBPUSD: LotSizeInstrumentSpec = {
+  symbol: 'GBPUSD',
+  asset_class: 'forex',
+  base_currency: 'GBP',
+  quote_currency: 'USD',
+  contract_size: '100000',
+  tick_size: '0.00001',
+  pip_size: '0.0001',
+  lot_step: '0.01',
+  min_lot: '0.01',
+}
+
 function runCase(
   instrument: LotSizeInstrumentSpec,
   entry_price: string,
@@ -69,6 +81,7 @@ function runCase(
   account_currency = 'USD',
   conversion?: {
     rate: number
+    quoteToUsdRate?: number | null
     symbolUsed: string | null
     method: 'identity' | 'direct' | 'inverse' | 'pivot'
     ts: number | null
@@ -82,7 +95,7 @@ function runCase(
     stop_loss,
     fx_rate_quote_to_account: conversion?.rate ?? null,
     instrument,
-    fx_rate_quote_to_usd: conversion?.rate ?? null,
+    fx_rate_quote_to_usd: conversion?.quoteToUsdRate ?? conversion?.rate ?? null,
     fx_symbol_used: conversion?.symbolUsed ?? null,
     fx_conversion_method: conversion?.method ?? null,
     fx_rate_timestamp: conversion?.ts ?? null,
@@ -95,10 +108,15 @@ describe('calculateLotSize FX-aware sizing', () => {
     const result = runCase(EURUSD, '1.1000', '1.0990')
 
     expect(result.valid).toBe(true)
+    expect(result.risk_currency).toBe('USD')
     expect(result.conversion_rate_quote_to_usd).toBe(1)
+    expect(result.conversion_rate_usd_to_account).toBe(1)
     expect(result.risk_per_one_lot).toBeCloseTo(100, 6)
     expect(result.lot_size).toBeCloseTo(1, 8)
     expect(result.actual_risk_at_stop).toBeCloseTo(100, 2)
+    expect(result.pip_value_per_lot_usd).toBeCloseTo(10, 6)
+    expect(result.tick_value_per_lot_usd).toBeCloseTo(1, 6)
+    expect(result.margin_required).toBeCloseTo(1100, 6)
   })
 
   it('rejects percentage risk above 100%', () => {
@@ -133,10 +151,14 @@ describe('calculateLotSize FX-aware sizing', () => {
     expect(result.valid).toBe(true)
     expect(result.conversion_symbol_used).toBe('USDJPY')
     expect(result.conversion_rate_quote_to_usd ?? 0).toBeCloseTo(1 / 150, 8)
+    expect(result.conversion_rate_usd_to_account).toBe(1)
     expect(result.risk_per_one_lot).toBeCloseTo(333.333, 3)
     expect(result.lot_size).toBeCloseTo(0.3, 8)
     expect(result.actual_risk_at_stop).toBeCloseTo(100, 2)
     expect(result.actual_risk_at_stop).toBeLessThanOrEqual(result.target_risk_amount + 0.01)
+    expect(result.pip_value_per_lot_usd).toBeCloseTo(6.666667, 4)
+    expect(result.tick_value_per_lot_usd).toBeCloseTo(0.666667, 4)
+    expect(result.margin_required).toBeCloseTo(320, 2)
   })
 
   it('updates lot size when FX quote changes', () => {
@@ -180,6 +202,7 @@ describe('calculateLotSize FX-aware sizing', () => {
     const result = runCase(EURJPY, '160.00', '159.50', 'EUR', {
       // JPY -> EUR
       rate: 1 / 165,
+      quoteToUsdRate: 1 / 150,
       symbolUsed: 'USDJPY + EURUSD',
       method: 'pivot',
       ts: 1700000000000,
@@ -189,9 +212,40 @@ describe('calculateLotSize FX-aware sizing', () => {
     expect(result.valid).toBe(true)
     expect(result.risk_currency).toBe('EUR')
     expect(result.conversion_rate_quote_to_account).toBeCloseTo(1 / 165, 8)
+    expect(result.conversion_rate_quote_to_usd).toBeCloseTo(1 / 150, 8)
+    expect(result.conversion_rate_usd_to_account).toBeCloseTo(150 / 165, 8)
     expect(result.risk_per_one_lot).toBeCloseTo(303.03, 2)
     expect(result.lot_size).toBeCloseTo(0.33, 8)
     expect(result.actual_risk_at_stop).toBeCloseTo(100, 2)
+    expect(result.pip_value_per_lot_account).toBeCloseTo(6.060606, 4)
+    expect(result.pip_value_per_lot_usd).toBeCloseTo(6.666667, 4)
+    expect(result.margin_required).toBeCloseTo(320, 2)
+  })
+
+  it('EUR account with GBPUSD converts USD-denominated risk and margin into EUR', () => {
+    const result = runCase(GBPUSD, '1.2500', '1.2480', 'EUR', {
+      rate: 1 / 1.1,
+      quoteToUsdRate: 1,
+      symbolUsed: 'EURUSD',
+      method: 'inverse',
+      ts: 1700000000000,
+      mode: 'mid',
+    })
+
+    expect(result.valid).toBe(true)
+    expect(result.risk_currency).toBe('EUR')
+    expect(result.conversion_rate_quote_to_account).toBeCloseTo(1 / 1.1, 8)
+    expect(result.conversion_rate_quote_to_usd).toBe(1)
+    expect(result.conversion_rate_usd_to_account).toBeCloseTo(1 / 1.1, 8)
+    expect(result.risk_per_one_lot_quote).toBeCloseTo(200, 6)
+    expect(result.risk_per_one_lot).toBeCloseTo(181.818182, 5)
+    expect(result.lot_size).toBeCloseTo(0.55, 8)
+    expect(result.actual_risk_at_stop).toBeCloseTo(100, 2)
+    expect(result.pip_value_per_lot_account).toBeCloseTo(9.090909, 6)
+    expect(result.pip_value_per_lot_usd).toBeCloseTo(10, 6)
+    expect(result.tick_value_per_lot_account).toBeCloseTo(0.909091, 6)
+    expect(result.tick_value_per_lot_usd).toBeCloseTo(1, 6)
+    expect(result.margin_required).toBeCloseTo(625, 2)
   })
 
   it('XAUUSD keeps USD quote (no conversion)', () => {

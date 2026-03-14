@@ -429,7 +429,6 @@ export const useTradeStore = defineStore('trades', () => {
   }
 
   async function fetchTrades(page = 1) {
-    refreshTradeQualityPreference()
     const requestVersion = ++fetchTradesRequestVersion
     loading.value = true
     error.value = null

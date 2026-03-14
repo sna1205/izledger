@@ -13,7 +13,23 @@ import { useSyncStatusStore } from '@/stores/syncStatusStore'
 import { useTradeStore } from '@/stores/tradeStore'
 import { useUiStore } from '@/stores/uiStore'
 import type { MissedTrade, MissedTradeImage } from '@/types/trade'
+import {
+  normalizeMissedTradeTags,
+  parseMissedTradeDateTime,
+  parseMissedTradeTags,
+  sanitizeMissedTradeTag,
+  validateMissedTradeIntegrity,
+} from '@/utils/missedTradeValidation'
 import { normalizeApiError, type NormalizedError } from '@/utils/apiError'
+import {
+  createIdleUploadStatus,
+  createUploadStatus,
+  DEFAULT_ALLOWED_IMAGE_TYPES,
+  preparePendingImages,
+  removeUploadProgressEntry,
+  revokePendingImagePreview,
+  type ImageUploadStatus,
+} from '@/utils/imageUploadWorkflow'
 
 const route = useRoute()
 const router = useRouter()
@@ -61,27 +77,34 @@ interface PendingMissedTradeImage {
 const MAX_IMAGE_COUNT = 5
 const MAX_IMAGE_SIZE_BYTES = 5 * 1024 * 1024
 const MAX_TOTAL_IMAGE_BYTES = 20 * 1024 * 1024
-const allowedImageTypes = new Set([
-  'image/jpeg',
-  'image/jpg',
-  'image/png',
-  'image/webp',
-  'image/bmp',
-])
 
 const existingImages = ref<MissedTradeImage[]>([])
 const pendingImages = ref<PendingMissedTradeImage[]>([])
-const imageUploadError = ref('')
-const uploadingImages = ref(false)
+const imageUploadStatus = ref<ImageUploadStatus>(createIdleUploadStatus())
 const deletingImageIds = ref<number[]>([])
 const uploadProgressByPendingId = ref<Record<string, number>>({})
+const postSaveQueue = reactive({
+  pendingImages: false,
+  lastSavedMissedTradeId: null as number | null,
+})
 
+const uploadingImages = computed(() =>
+  imageUploadStatus.value.state === 'validating' || imageUploadStatus.value.state === 'uploading'
+)
 const totalImageCount = computed(() => existingImages.value.length + pendingImages.value.length)
 const totalImageSize = computed(() => {
   const existingTotal = existingImages.value.reduce((sum, image) => sum + Number(image.file_size || 0), 0)
   const pendingTotal = pendingImages.value.reduce((sum, image) => sum + image.file.size, 0)
   return existingTotal + pendingTotal
 })
+const hasPendingPostSave = computed(() =>
+  postSaveQueue.pendingImages && postSaveQueue.lastSavedMissedTradeId !== null
+)
+const imageUploadRetryable = computed(() =>
+  imageUploadStatus.value.canRetry
+  && pendingImages.value.length > 0
+  && postSaveQueue.lastSavedMissedTradeId !== null
+)
 
 const missedTradeId = computed(() => {
   const value = Number(route.params.id)
@@ -93,35 +116,15 @@ const missedSetupFormId = 'missed-setup-form'
 
 const formErrors = computed<Record<string, string>>(() => {
   const errors: Record<string, string> = {}
-
-  const pair = form.pair.trim().toUpperCase()
-  const model = form.model.trim()
-  const dateTimestamp = parseLocalDateTime(form.date)
-  const now = Date.now()
-
-  if (!pair) {
-    errors.pair = 'Pair is required.'
-  } else if (pair.length > 30) {
-    errors.pair = 'Pair must be 30 characters or fewer.'
+  return {
+    ...errors,
+    ...validateMissedTradeIntegrity({
+      pair: form.pair,
+      model: form.model,
+      date: form.date,
+      tags: form.tags,
+    }),
   }
-
-  if (!model) {
-    errors.model = 'Model is required.'
-  } else if (model.length > 120) {
-    errors.model = 'Model must be 120 characters or fewer.'
-  }
-
-  if (dateTimestamp === null) {
-    errors.date = 'Date is required.'
-  } else if (dateTimestamp > now + 60_000) {
-    errors.date = 'Date cannot be in the future.'
-  }
-
-  if (form.tags.length === 0) {
-    errors.tags = 'At least one reason tag is required.'
-  }
-
-  return errors
 })
 
 const selectedInstrumentId = computed({
@@ -150,13 +153,6 @@ function fieldError(name: string) {
   return serverFieldErrors.value[name]?.[0] ?? ''
 }
 
-function parseTags(reason: string): string[] {
-  return reason
-    .split(',')
-    .map((tag) => tag.trim())
-    .filter(Boolean)
-}
-
 function toLocalDateTime(value: string) {
   const date = new Date(value)
   const offset = date.getTimezoneOffset() * 60000
@@ -167,23 +163,20 @@ function nowLocalDateTime() {
   return toLocalDateTime(new Date().toISOString())
 }
 
-function parseLocalDateTime(value: string): number | null {
-  if (!value) return null
-  const timestamp = new Date(value).getTime()
-  return Number.isNaN(timestamp) ? null : timestamp
-}
-
 function toggleTag(tag: string) {
-  if (form.tags.includes(tag)) {
-    form.tags = form.tags.filter((item) => item !== tag)
+  const normalizedTag = sanitizeMissedTradeTag(tag)
+  if (!normalizedTag) return
+
+  if (form.tags.includes(normalizedTag)) {
+    form.tags = form.tags.filter((item) => item !== normalizedTag)
     return
   }
 
-  form.tags = [...form.tags, tag]
+  form.tags = [...form.tags, normalizedTag]
 }
 
 function addCustomTag() {
-  const value = customTag.value.trim().toLowerCase()
+  const value = sanitizeMissedTradeTag(customTag.value)
   if (!value || form.tags.includes(value)) return
 
   form.tags = [...form.tags, value]
@@ -199,7 +192,7 @@ function setFormFromMissedTrade(entry: MissedTrade) {
   form.model = entry.model
   form.date = toLocalDateTime(entry.date)
   form.notes = entry.notes ?? ''
-  form.tags = parseTags(entry.reason)
+  form.tags = parseMissedTradeTags(entry.reason)
   existingImages.value = (entry.images ?? [])
     .slice()
     .sort((a, b) => a.sort_order - b.sort_order || a.id - b.id)
@@ -220,7 +213,7 @@ function applyQuickDefaultsFromQuery() {
     form.model = model
   }
   if (reason) {
-    const parsed = parseTags(reason)
+    const parsed = parseMissedTradeTags(reason)
     if (parsed.length > 0) {
       form.tags = Array.from(new Set([...form.tags, ...parsed]))
     }
@@ -228,16 +221,21 @@ function applyQuickDefaultsFromQuery() {
 }
 
 function buildPayload(): MissedTradePayload {
-  const dateTimestamp = parseLocalDateTime(form.date)
+  const dateTimestamp = parseMissedTradeDateTime(form.date)
   if (dateTimestamp === null) {
     throw new Error('Date is invalid.')
+  }
+
+  const normalizedTags = normalizeMissedTradeTags(form.tags)
+  if (normalizedTags.length === 0) {
+    throw new Error('At least one reason tag is required.')
   }
 
   return {
     pair: form.pair.trim().toUpperCase(),
     model: form.model.trim(),
     date: new Date(dateTimestamp).toISOString(),
-    reason: form.tags.join(', '),
+    reason: normalizedTags.join(', '),
     notes: form.notes.trim() ? form.notes.trim() : null,
   }
 }
@@ -271,19 +269,43 @@ function applyServerFieldErrors(normalized: NormalizedError): void {
   serverFieldErrors.value = next
 }
 
+function setImageUploadStatus(
+  state: ImageUploadStatus['state'],
+  message = '',
+  details: string[] = [],
+  canRetry = false
+) {
+  imageUploadStatus.value = createUploadStatus(state, message, details, canRetry)
+}
+
 function clearPendingImages() {
   for (const image of pendingImages.value) {
-    URL.revokeObjectURL(image.preview_url)
+    revokePendingImagePreview(image)
   }
   pendingImages.value = []
   uploadProgressByPendingId.value = {}
+  if (imageUploadStatus.value.state !== 'uploading') {
+    imageUploadStatus.value = createIdleUploadStatus()
+  }
+}
+
+function detachPendingImage(id: string): PendingMissedTradeImage | null {
+  const index = pendingImages.value.findIndex((image) => image.id === id)
+  if (index < 0) return null
+  const [removed] = pendingImages.value.splice(index, 1)
+  if (!removed) return null
+  revokePendingImagePreview(removed)
+  uploadProgressByPendingId.value = removeUploadProgressEntry(uploadProgressByPendingId.value, removed.id)
+  return removed
 }
 
 function removePendingImage(id: string) {
-  const index = pendingImages.value.findIndex((image) => image.id === id)
-  if (index < 0) return
-  URL.revokeObjectURL(pendingImages.value[index]!.preview_url)
-  pendingImages.value.splice(index, 1)
+  const removed = detachPendingImage(id)
+  if (!removed) return
+
+  if (pendingImages.value.length === 0 && imageUploadStatus.value.canRetry) {
+    imageUploadStatus.value = createIdleUploadStatus()
+  }
 }
 
 function reorderPendingImages(payload: { from: number; to: number }) {
@@ -316,81 +338,65 @@ async function removeExistingImage(imageId: number) {
 }
 
 async function onSelectImageFiles(files: File[]) {
-  imageUploadError.value = ''
   if (files.length === 0) return
 
-  const availableSlots = MAX_IMAGE_COUNT - totalImageCount.value
-  if (availableSlots <= 0) {
-    imageUploadError.value = 'Maximum 5 images per missed trade allowed.'
-    return
-  }
+  setImageUploadStatus('validating', 'Validating screenshots...')
 
-  const selected = files.slice(0, availableSlots)
-  const queued: PendingMissedTradeImage[] = []
-
-  for (const file of selected) {
-    if (!allowedImageTypes.has(file.type)) {
-      imageUploadError.value = 'Only jpg, jpeg, png, webp, and bmp files are allowed.'
-      continue
-    }
-
-    if (file.size > MAX_IMAGE_SIZE_BYTES) {
-      imageUploadError.value = 'Each image must be 5MB or smaller.'
-      continue
-    }
-
-    const compressed = await compressImage(file)
-    if (compressed.size > MAX_IMAGE_SIZE_BYTES) {
-      imageUploadError.value = 'Compressed image still exceeds 5MB. Use a smaller image.'
-      continue
-    }
-
-    const previewUrl = URL.createObjectURL(compressed)
-    queued.push({
+  const result = await preparePendingImages(files, {
+    entityLabel: 'missed trade',
+    currentCount: totalImageCount.value,
+    currentTotalBytes: totalImageSize.value,
+    maxFiles: MAX_IMAGE_COUNT,
+    maxFileBytes: MAX_IMAGE_SIZE_BYTES,
+    maxTotalBytes: MAX_TOTAL_IMAGE_BYTES,
+    allowedTypes: DEFAULT_ALLOWED_IMAGE_TYPES,
+    buildPendingImage: ({ file, previewUrl }) => ({
       id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
-      file: compressed,
+      file,
       preview_url: previewUrl,
       context_tag: 'entry',
       timeframe: '',
       annotation_notes: '',
-    })
+    }),
+  })
+
+  if (result.accepted.length > 0) {
+    pendingImages.value = [...pendingImages.value, ...result.accepted]
   }
 
-  if (queued.length === 0) return
-
-  const queuedBytes = queued.reduce((sum, image) => sum + image.file.size, 0)
-  if ((totalImageSize.value + queuedBytes) > MAX_TOTAL_IMAGE_BYTES) {
-    for (const image of queued) {
-      URL.revokeObjectURL(image.preview_url)
-    }
-    imageUploadError.value = 'Total image uploads per missed trade cannot exceed 20MB.'
+  if (result.errors.length > 0) {
+    setImageUploadStatus('error', result.errors[0] ?? 'Some screenshots could not be added.', result.errors)
     return
   }
 
-  pendingImages.value = [...pendingImages.value, ...queued]
+  const count = result.accepted.length
+  setImageUploadStatus(
+    'success',
+    `${count} screenshot${count === 1 ? '' : 's'} ready to upload.`
+  )
 }
 
-async function uploadPendingImages(entry: MissedTrade) {
+async function uploadPendingImages(missedTradeId: number) {
   if (pendingImages.value.length === 0) return
-
-  uploadingImages.value = true
-  imageUploadError.value = ''
+  const initialCount = pendingImages.value.length
+  let uploadedCount = 0
+  setImageUploadStatus(
+    'uploading',
+    `Uploading ${initialCount} screenshot${initialCount === 1 ? '' : 's'}...`
+  )
 
   try {
-    const baseSort = existingImages.value.length
-    const uploadedImages: MissedTradeImage[] = []
-
-    for (let index = 0; index < pendingImages.value.length; index += 1) {
-      const image = pendingImages.value[index]!
+    while (pendingImages.value.length > 0) {
+      const image = pendingImages.value[0]!
       uploadProgressByPendingId.value = {
         ...uploadProgressByPendingId.value,
         [image.id]: 0,
       }
 
       const uploaded = await missedTradeStore.uploadMissedTradeImage(
-        entry.id,
+        missedTradeId,
         image.file,
-        baseSort + index,
+        existingImages.value.length,
         (progress) => {
           uploadProgressByPendingId.value = {
             ...uploadProgressByPendingId.value,
@@ -399,17 +405,51 @@ async function uploadPendingImages(entry: MissedTrade) {
         }
       )
 
-      uploadedImages.push(uploaded)
+      existingImages.value = [...existingImages.value, uploaded]
+        .sort((a, b) => a.sort_order - b.sort_order || a.id - b.id)
+      uploadedCount += 1
+      detachPendingImage(image.id)
     }
 
-    existingImages.value = [...existingImages.value, ...uploadedImages]
-      .sort((a, b) => a.sort_order - b.sort_order || a.id - b.id)
-    clearPendingImages()
+    setImageUploadStatus(
+      'success',
+      `Uploaded ${uploadedCount} screenshot${uploadedCount === 1 ? '' : 's'}.`
+    )
   } catch (error) {
-    imageUploadError.value = extractErrorMessage(error)
+    const details = uploadedCount > 0
+      ? [`${uploadedCount} screenshot${uploadedCount === 1 ? '' : 's'} already uploaded. Retry the remaining files.`]
+      : []
+    setImageUploadStatus('error', extractErrorMessage(error), details, pendingImages.value.length > 0)
     throw error
-  } finally {
-    uploadingImages.value = false
+  }
+}
+
+function clearPostSaveQueue() {
+  postSaveQueue.pendingImages = false
+  postSaveQueue.lastSavedMissedTradeId = null
+}
+
+async function retryPostSaveImages() {
+  const missedTradeIdToResume = postSaveQueue.lastSavedMissedTradeId
+  if (missedTradeIdToResume === null || !postSaveQueue.pendingImages) return
+
+  try {
+    await uploadPendingImages(missedTradeIdToResume)
+    postSaveQueue.pendingImages = false
+    serverFieldErrors.value = {}
+    uiStore.toast({
+      type: 'success',
+      title: 'Image upload completed',
+      message: 'Screenshots were attached to this missed setup.',
+    })
+    clearPostSaveQueue()
+    void router.push('/missed-trades')
+  } catch {
+    uiStore.toast({
+      type: 'info',
+      title: 'Missed setup saved partially',
+      message: `Missed setup #${missedTradeIdToResume} is already saved. Retry image upload to finish attachments.`,
+    })
   }
 }
 
@@ -428,11 +468,13 @@ async function submit() {
 
   try {
     const payload = buildPayload()
+    form.tags = parseMissedTradeTags(payload.reason)
     const hadPendingImages = pendingImages.value.length > 0
     let savedEntry: MissedTrade
 
-    if (isEditMode.value && missedTradeId.value !== null) {
-      savedEntry = await missedTradeStore.updateMissedTrade(missedTradeId.value, payload)
+    const writableMissedTradeId = missedTradeId.value ?? postSaveQueue.lastSavedMissedTradeId
+    if (writableMissedTradeId !== null) {
+      savedEntry = await missedTradeStore.updateMissedTrade(writableMissedTradeId, payload)
       uiStore.toast({
         type: 'success',
         title: 'Missed setup updated',
@@ -445,7 +487,11 @@ async function submit() {
       })
     }
 
-    await uploadPendingImages(savedEntry)
+    postSaveQueue.lastSavedMissedTradeId = savedEntry.id
+    postSaveQueue.pendingImages = pendingImages.value.length > 0
+
+    await uploadPendingImages(savedEntry.id)
+    postSaveQueue.pendingImages = false
 
     if (hadPendingImages) {
       uiStore.toast({
@@ -455,10 +501,21 @@ async function submit() {
       })
     }
 
+    clearPostSaveQueue()
     void router.push('/missed-trades')
   } catch (error) {
     const normalized = normalizeApiError(error)
     applyServerFieldErrors(normalized)
+
+    if (postSaveQueue.lastSavedMissedTradeId !== null && hasPendingPostSave.value) {
+      uiStore.toast({
+        type: 'info',
+        title: 'Missed setup saved partially',
+        message: `Missed setup #${postSaveQueue.lastSavedMissedTradeId} is already saved. Retry image upload to finish attachments.`,
+      })
+      return
+    }
+
     uiStore.toast({
       type: 'error',
       title: 'Failed to save missed setup',
@@ -505,6 +562,7 @@ async function loadEntryIfNeeded() {
     const entry = await missedTradeStore.fetchMissedTrade(missedTradeId.value)
     setFormFromMissedTrade(entry)
     serverFieldErrors.value = {}
+    clearPostSaveQueue()
   } catch {
     uiStore.toast({
       type: 'error',
@@ -534,64 +592,6 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   clearPendingImages()
 })
-
-async function compressImage(file: File): Promise<File> {
-  try {
-    const image = await loadImage(file)
-    const maxDimension = 1920
-    const ratio = Math.min(1, maxDimension / Math.max(image.width, image.height))
-    const targetWidth = Math.max(1, Math.round(image.width * ratio))
-    const targetHeight = Math.max(1, Math.round(image.height * ratio))
-
-    const canvas = document.createElement('canvas')
-    canvas.width = targetWidth
-    canvas.height = targetHeight
-
-    const context = canvas.getContext('2d')
-    if (!context) return file
-
-    context.drawImage(image, 0, 0, targetWidth, targetHeight)
-
-    const outputType = file.type === 'image/webp' ? 'image/webp' : 'image/jpeg'
-    const blob = await new Promise<Blob | null>((resolve) => {
-      canvas.toBlob(resolve, outputType, 0.82)
-    })
-
-    if (!blob) return file
-    if (blob.size >= file.size) return file
-
-    const normalizedName = normalizeFileName(file.name, outputType)
-    return new File([blob], normalizedName, {
-      type: outputType,
-      lastModified: Date.now(),
-    })
-  } catch {
-    return file
-  }
-}
-
-function normalizeFileName(name: string, mimeType: string) {
-  const base = name.replace(/\.[^/.]+$/, '')
-  const ext = mimeType === 'image/webp' ? 'webp' : 'jpg'
-  return `${base}.${ext}`
-}
-
-async function loadImage(file: File): Promise<HTMLImageElement> {
-  const url = URL.createObjectURL(file)
-
-  return await new Promise((resolve, reject) => {
-    const image = new Image()
-    image.onload = () => {
-      URL.revokeObjectURL(url)
-      resolve(image)
-    }
-    image.onerror = () => {
-      URL.revokeObjectURL(url)
-      reject(new Error('Unable to load image'))
-    }
-    image.src = url
-  })
-}
 </script>
 
 <template>
@@ -621,7 +621,7 @@ async function loadImage(file: File): Promise<HTMLImageElement> {
             <Plus class="h-4 w-4" />
             {{
               uploadingImages
-                ? 'Uploading...'
+                ? 'Uploading images...'
                 : missedTradeStore.saving
                   ? 'Saving...'
                   : isEditMode ? 'Update' : 'Save'
@@ -659,6 +659,10 @@ async function loadImage(file: File): Promise<HTMLImageElement> {
           <p class="trade-section-title">Reason Tags</p>
           <div class="execution-tag-panel p-3">
             <p class="kicker-label">Tags</p>
+            <p class="section-note mt-2">
+              Add at least one reason tag for behavioral context. Weekend captures are allowed; add a
+              <code>session:*</code> tag if timing matters.
+            </p>
             <div class="chip-row mt-2">
               <button
                 v-for="tag in reasonTagOptions"
@@ -710,19 +714,30 @@ async function loadImage(file: File): Promise<HTMLImageElement> {
                 :offline-warning="isFallbackMode"
                 :max-files="MAX_IMAGE_COUNT"
                 :uploading="uploadingImages"
+                :upload-state="imageUploadStatus.state"
+                :status-message="imageUploadStatus.message"
+                :status-details="imageUploadStatus.details"
+                :retryable="imageUploadRetryable"
+                retry-label="Retry image upload"
                 :upload-progress="uploadProgressByPendingId"
                 :deleting-image-ids="deletingImageIds"
-                :error="imageUploadError"
                 @select-files="onSelectImageFiles"
                 @remove-pending="removePendingImage"
                 @remove-existing="removeExistingImage"
                 @reorder-pending="reorderPendingImages"
+                @retry-upload="retryPostSaveImages"
               />
             </div>
           </details>
         </section>
 
         <div class="flex items-center justify-end gap-2">
+          <span
+            v-if="hasPendingPostSave"
+            class="mr-auto text-xs text-amber-300"
+          >
+            Partial saved: Missed setup #{{ postSaveQueue.lastSavedMissedTradeId }}. Images pending.
+          </span>
           <button
             v-if="isEditMode"
             type="button"
@@ -733,6 +748,15 @@ async function loadImage(file: File): Promise<HTMLImageElement> {
             Delete
           </button>
           <button type="button" class="btn btn-ghost px-4 py-2 text-sm" @click="router.push('/missed-trades')">Cancel</button>
+          <button
+            v-if="hasPendingPostSave"
+            type="button"
+            class="btn btn-ghost px-4 py-2 text-sm"
+            :disabled="missedTradeStore.saving || uploadingImages"
+            @click="retryPostSaveImages"
+          >
+            Retry Image Upload
+          </button>
           <button
             type="submit"
             class="btn btn-primary inline-flex items-center gap-2 px-4 py-2 text-sm"

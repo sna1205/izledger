@@ -2,6 +2,7 @@
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { GripVertical, ImagePlus, Loader2, Trash2, UploadCloud } from 'lucide-vue-next'
 import type { ImageContextTag, TradeImage } from '@/types/trade'
+import type { ImageUploadState } from '@/utils/imageUploadWorkflow'
 
 export interface PendingTradeImage {
   id: string
@@ -17,20 +18,30 @@ const props = withDefaults(
     existingImages: TradeImage[]
     pendingImages: PendingTradeImage[]
     uploading?: boolean
+    uploadState?: ImageUploadState
     maxFiles?: number
     uploadProgress?: Record<string, number>
     deletingImageIds?: number[]
     error?: string
+    statusMessage?: string
+    statusDetails?: string[]
+    retryable?: boolean
+    retryLabel?: string
     title?: string
     uploadHint?: string
     offlineWarning?: boolean
   }>(),
   {
     uploading: false,
+    uploadState: 'idle',
     maxFiles: 5,
     uploadProgress: () => ({}),
     deletingImageIds: () => [],
     error: '',
+    statusMessage: '',
+    statusDetails: () => [],
+    retryable: false,
+    retryLabel: 'Retry upload',
     title: 'Execution Screenshots',
     uploadHint: 'Max 5 images - jpg, jpeg, png, webp, bmp - 5MB each - paste with Ctrl+V',
     offlineWarning: false,
@@ -42,6 +53,7 @@ const emit = defineEmits<{
   (event: 'remove-pending', id: string): void
   (event: 'remove-existing', id: number): void
   (event: 'reorder-pending', payload: { from: number; to: number }): void
+  (event: 'retry-upload'): void
 }>()
 
 const inputRef = ref<HTMLInputElement | null>(null)
@@ -50,6 +62,15 @@ const dragIndex = ref<number | null>(null)
 
 const totalImages = computed(() => props.existingImages.length + props.pendingImages.length)
 const canSelectMore = computed(() => totalImages.value < props.maxFiles)
+const statusTone = computed(() => {
+  if (props.uploadState === 'error' || props.error) return 'is-danger'
+  if (props.uploadState === 'success') return 'is-success'
+  return 'is-muted'
+})
+const resolvedStatusMessage = computed(() => props.statusMessage || props.error)
+const hasStatus = computed(() =>
+  resolvedStatusMessage.value.length > 0 || props.statusDetails.length > 0
+)
 
 function openPicker() {
   if (!canSelectMore.value || props.uploading) return
@@ -297,7 +318,27 @@ onBeforeUnmount(() => {
       <ImagePlus class="h-5 w-5 trade-uploader-corner-icon" />
     </div>
 
-    <p v-if="error" class="field-error-text">{{ error }}</p>
+    <div v-if="hasStatus" class="panel p-3 text-sm" :class="statusTone">
+      <div class="flex items-center justify-between gap-3">
+        <p :class="props.uploadState === 'error' || error ? 'field-error-text' : 'muted'">
+          {{ resolvedStatusMessage }}
+        </p>
+        <button
+          v-if="retryable"
+          type="button"
+          class="btn btn-ghost px-3 py-1 text-xs"
+          :disabled="uploading"
+          @click.stop="emit('retry-upload')"
+        >
+          {{ retryLabel }}
+        </button>
+      </div>
+      <ul v-if="statusDetails.length > 0" class="mt-2 space-y-1 text-xs muted">
+        <li v-for="detail in statusDetails" :key="detail">
+          {{ detail }}
+        </li>
+      </ul>
+    </div>
     <div v-if="offlineWarning" class="panel p-3 text-sm">
       Images won’t persist offline until offline storage is enabled.
     </div>

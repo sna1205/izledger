@@ -5,9 +5,11 @@ namespace App\Http\Controllers\Api;
 use App\Http\Controllers\Controller;
 use App\Models\MissedTrade;
 use App\Models\MissedTradeImage;
+use Carbon\CarbonImmutable;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Facades\Storage;
+use Illuminate\Support\Facades\Validator;
 
 class MissedTradeController extends Controller
 {
@@ -112,15 +114,104 @@ class MissedTradeController extends Controller
 
     private function validatePayload(Request $request, bool $isUpdate = false): array
     {
+        $input = $this->normalizeInput($request->all());
+        $request->replace($input);
         $required = $isUpdate ? 'sometimes' : 'required';
 
-        return $request->validate([
-            'pair' => [$required, 'string', 'max:30'],
-            'model' => [$required, 'string', 'max:120'],
-            'reason' => [$required, 'string', 'max:255'],
-            'date' => [$required, 'date'],
-            'notes' => ['nullable', 'string'],
-        ]);
+        $validator = Validator::make(
+            $input,
+            [
+                'pair' => [$required, 'string', 'max:30'],
+                'model' => [$required, 'string', 'max:120'],
+                'reason' => [$required, 'string', 'max:255'],
+                'date' => [$required, 'date'],
+                'notes' => ['nullable', 'string'],
+            ],
+            [
+                'date.date' => 'Date is invalid.',
+            ]
+        );
+
+        $validator->after(function ($validator) use ($input, $isUpdate): void {
+            if (array_key_exists('reason', $input) || ! $isUpdate) {
+                $tags = $this->normalizeReasonTags((string) ($input['reason'] ?? ''));
+                if (count($tags) === 0) {
+                    $validator->errors()->add('reason', 'At least one reason tag is required.');
+                }
+            }
+
+            if (array_key_exists('date', $input)) {
+                $timestamp = $this->parseTimestamp((string) $input['date']);
+                if ($timestamp === null) {
+                    $validator->errors()->add('date', 'Date is invalid.');
+                } elseif ($timestamp > now()->addMinute()->getTimestamp()) {
+                    $validator->errors()->add('date', 'Date cannot be in the future.');
+                }
+            }
+        });
+
+        $payload = $validator->validate();
+        if (array_key_exists('reason', $payload)) {
+            $payload['reason'] = implode(', ', $this->normalizeReasonTags((string) $payload['reason']));
+        }
+
+        return $payload;
+    }
+
+    private function normalizeInput(array $input): array
+    {
+        if (! array_key_exists('reason', $input) && array_key_exists('reason_tags', $input) && is_array($input['reason_tags'])) {
+            $input['reason'] = implode(', ', $input['reason_tags']);
+        }
+
+        return $input;
+    }
+
+    /**
+     * @return array<int,string>
+     */
+    private function normalizeReasonTags(string $raw): array
+    {
+        $parts = preg_split('/,/', $raw) ?: [];
+        $tags = [];
+        foreach ($parts as $part) {
+            $normalized = $this->sanitizeReasonTag((string) $part);
+            if ($normalized === '') {
+                continue;
+            }
+            $tags[$normalized] = true;
+        }
+
+        return array_keys($tags);
+    }
+
+    private function sanitizeReasonTag(string $value): string
+    {
+        $normalized = strtolower(trim($value));
+        if ($normalized === '') {
+            return '';
+        }
+
+        $normalized = preg_replace('/\s+/', '-', $normalized) ?? '';
+        $normalized = preg_replace('/[^a-z0-9:_-]+/', '-', $normalized) ?? '';
+        $normalized = preg_replace('/-{2,}/', '-', $normalized) ?? '';
+        $normalized = trim($normalized, '-');
+
+        return mb_substr($normalized, 0, 40);
+    }
+
+    private function parseTimestamp(string $value): ?int
+    {
+        $trimmed = trim($value);
+        if ($trimmed === '') {
+            return null;
+        }
+
+        try {
+            return CarbonImmutable::parse($trimmed)->getTimestamp();
+        } catch (\Throwable) {
+            return null;
+        }
     }
 
     /**

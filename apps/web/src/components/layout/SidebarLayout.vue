@@ -405,6 +405,7 @@ watch(
               class="workspace-theme-trigger"
               :disabled="syncing"
               :title="syncing ? 'Sync in progress' : 'Sync now'"
+              :aria-label="syncing ? 'Sync in progress' : 'Sync now'"
               @click="runSyncNow"
             >
               <RefreshCw class="h-4 w-4" :class="{ 'animate-spin': syncing }" />

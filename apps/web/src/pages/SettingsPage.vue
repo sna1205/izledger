@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
+import { storeToRefs } from 'pinia'
 import { useRouter } from 'vue-router'
 import ProfileSettingsSection from '@/components/settings/ProfileSettingsSection.vue'
 import ThemeSettingsSection from '@/components/settings/ThemeSettingsSection.vue'
@@ -7,14 +8,24 @@ import SecuritySessionsSection from '@/components/settings/SecuritySessionsSecti
 import GovernancePointersSection from '@/components/settings/GovernancePointersSection.vue'
 import OfflineModeSection from '@/components/settings/OfflineModeSection.vue'
 import { useAuthStore } from '@/stores/authStore'
+import { useSyncStatusStore } from '@/stores/syncStatusStore'
 import { useUiStore } from '@/stores/uiStore'
 import { useUserPreferencesStore } from '@/stores/userPreferencesStore'
 import { isOfflineModeEnabled, setOfflineModeEnabled } from '@/services/localFallback'
 
 const router = useRouter()
 const authStore = useAuthStore()
+const syncStatusStore = useSyncStatusStore()
 const uiStore = useUiStore()
 const preferencesStore = useUserPreferencesStore()
+const {
+  browserOnline,
+  isFallbackMode,
+  queueSummary,
+  syncing,
+  lastSyncAt,
+  lastSyncError,
+} = storeToRefs(syncStatusStore)
 
 const profileSaving = ref(false)
 const securityBusy = ref(false)
@@ -110,15 +121,37 @@ async function logoutCurrentSession() {
 }
 
 async function changeOfflineMode(next: boolean) {
+  if (!next && queueSummary.value.unsynced > 0) {
+    uiStore.toast({
+      type: 'info',
+      title: 'Offline drafts still need sync',
+      message: 'Sync or discard queued offline drafts before turning off local draft persistence.',
+    })
+    return
+  }
+
+  if (!next) {
+    const confirmed = await uiStore.askConfirmation({
+      title: 'Turn off offline mode?',
+      message: 'This clears locally persisted in-progress trade/account drafts on this device.',
+      confirmText: 'Turn off',
+      danger: true,
+    })
+    if (!confirmed) {
+      return
+    }
+  }
+
   offlineModeBusy.value = true
   try {
     offlineModeEnabled.value = await setOfflineModeEnabled(next)
+    await syncStatusStore.refreshQueueState()
     uiStore.toast({
       type: 'success',
       title: 'Offline mode updated',
       message: offlineModeEnabled.value
-        ? 'Sensitive trade/account drafts will persist in IndexedDB.'
-        : 'Sensitive trade/account drafts will no longer persist locally.',
+        ? 'In-progress drafts now persist locally and queued writes will sync when connectivity returns.'
+        : 'In-progress local draft persistence is disabled for this device.',
     })
   } catch {
     uiStore.toast({
@@ -133,6 +166,7 @@ async function changeOfflineMode(next: boolean) {
 
 onMounted(() => {
   offlineModeEnabled.value = isOfflineModeEnabled()
+  void syncStatusStore.refreshQueueState()
   void initialize()
 })
 </script>
@@ -181,7 +215,16 @@ onMounted(() => {
         <OfflineModeSection
           :enabled="offlineModeEnabled"
           :busy="offlineModeBusy"
+          :is-online="browserOnline"
+          :is-fallback-mode="isFallbackMode"
+          :draft-count="queueSummary.draft_local"
+          :pending-count="queueSummary.pending_sync"
+          :conflict-count="queueSummary.conflict"
+          :syncing="syncing"
+          :last-sync-at="lastSyncAt"
+          :last-sync-error="lastSyncError"
           @toggle="changeOfflineMode"
+          @sync-now="syncStatusStore.syncQueueNow"
         />
       </section>
 
@@ -215,5 +258,23 @@ onMounted(() => {
 
 .settings-hub-nav .chip-btn {
   text-decoration: none;
+}
+
+@media (max-width: 767px) {
+  .settings-hub-nav {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    padding-bottom: 0.2rem;
+    scrollbar-width: none;
+  }
+
+  .settings-hub-nav::-webkit-scrollbar {
+    display: none;
+  }
+
+  .settings-hub-nav .chip-btn {
+    flex: 0 0 auto;
+    white-space: nowrap;
+  }
 }
 </style>

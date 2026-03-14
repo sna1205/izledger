@@ -1,5 +1,6 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
+import { getScope, scopedKey } from '@/services/storageScope'
 
 export type ThemeMode = 'light' | 'dark' | 'forest' | 'dawn'
 export type ToastType = 'success' | 'error' | 'info'
@@ -9,6 +10,22 @@ export const THEME_OPTIONS: Array<{ value: ThemeMode; label: string }> = [
   { value: 'forest', label: 'Forest' },
   { value: 'dawn', label: 'Dawn' },
 ]
+
+const LEGACY_THEME_STORAGE_KEY = 'theme_mode'
+const THEME_STORAGE_NAMESPACE = 'ui-preferences'
+const THEME_STORAGE_KEY = 'theme_mode'
+const THEME_COLOR_BY_MODE: Record<ThemeMode, string> = {
+  light: '#edf2f7',
+  dark: '#020906',
+  forest: '#e8f2eb',
+  dawn: '#fdf3ea',
+}
+const COLOR_SCHEME_BY_MODE: Record<ThemeMode, 'light' | 'dark'> = {
+  light: 'light',
+  dark: 'dark',
+  forest: 'light',
+  dawn: 'light',
+}
 
 interface ToastItem {
   id: number
@@ -30,6 +47,86 @@ interface ConfirmState {
 
 let toastId = 1
 
+export function isThemeMode(value: string | null): value is ThemeMode {
+  if (!value) return false
+  return THEME_OPTIONS.some((option) => option.value === value)
+}
+
+function safeLocalStorage(): Storage | null {
+  try {
+    if (typeof localStorage === 'undefined') return null
+    return localStorage
+  } catch {
+    return null
+  }
+}
+
+function safeGet(storage: Storage, key: string): string | null {
+  try {
+    return storage.getItem(key)
+  } catch {
+    return null
+  }
+}
+
+function safeSet(storage: Storage, key: string, value: string): void {
+  try {
+    storage.setItem(key, value)
+  } catch {
+    // Ignore storage write failures.
+  }
+}
+
+function resolveThemeStorageKey(): string {
+  return scopedKey(THEME_STORAGE_NAMESPACE, THEME_STORAGE_KEY)
+}
+
+function readPersistedTheme(): ThemeMode | null {
+  const storage = safeLocalStorage()
+  if (!storage) return null
+
+  const scope = getScope()
+  const scopedValue = scope.userId === null ? null : safeGet(storage, resolveThemeStorageKey())
+  if (isThemeMode(scopedValue)) {
+    return scopedValue
+  }
+
+  const legacyValue = safeGet(storage, LEGACY_THEME_STORAGE_KEY)
+  if (isThemeMode(legacyValue)) {
+    return legacyValue
+  }
+
+  if (scope.userId === null) {
+    const anonymousScopedValue = safeGet(storage, resolveThemeStorageKey())
+    if (isThemeMode(anonymousScopedValue)) {
+      return anonymousScopedValue
+    }
+  }
+
+  return null
+}
+
+function persistTheme(mode: ThemeMode): void {
+  const storage = safeLocalStorage()
+  if (!storage) return
+
+  safeSet(storage, LEGACY_THEME_STORAGE_KEY, mode)
+  safeSet(storage, resolveThemeStorageKey(), mode)
+}
+
+function ensureThemeColorMetaTag(): HTMLMetaElement | null {
+  if (typeof document === 'undefined') return null
+
+  const existing = document.querySelector<HTMLMetaElement>('meta[name="theme-color"]')
+  if (existing) return existing
+
+  if (!document.head?.appendChild) return null
+  const meta = document.createElement('meta')
+  meta.name = 'theme-color'
+  document.head.appendChild(meta)
+  return meta
+}
+
 export const useUiStore = defineStore('ui', () => {
   const theme = ref<ThemeMode>('dark')
   const toasts = ref<ToastItem[]>([])
@@ -42,15 +139,24 @@ export const useUiStore = defineStore('ui', () => {
     danger: false,
   })
 
-  function isThemeMode(value: string | null): value is ThemeMode {
-    if (!value) return false
-    return THEME_OPTIONS.some((option) => option.value === value)
-  }
-
-  function applyTheme(mode: ThemeMode) {
+  function applyTheme(mode: ThemeMode, options: { persist?: boolean } = {}) {
     theme.value = mode
-    document.documentElement.dataset.theme = mode
-    localStorage.setItem('theme_mode', mode)
+
+    if (typeof document !== 'undefined') {
+      document.documentElement.dataset.theme = mode
+      document.documentElement.style.colorScheme = COLOR_SCHEME_BY_MODE[mode]
+      if (document.body) {
+        document.body.dataset.theme = mode
+      }
+      const themeColorMeta = ensureThemeColorMetaTag()
+      if (themeColorMeta) {
+        themeColorMeta.content = THEME_COLOR_BY_MODE[mode]
+      }
+    }
+
+    if (options.persist !== false) {
+      persistTheme(mode)
+    }
   }
 
   function setTheme(mode: ThemeMode) {
@@ -58,9 +164,16 @@ export const useUiStore = defineStore('ui', () => {
   }
 
   function initTheme() {
-    const saved = localStorage.getItem('theme_mode')
-    const initial: ThemeMode = isThemeMode(saved) ? saved : 'dark'
-    applyTheme(initial)
+    const initial = readPersistedTheme() ?? 'dark'
+    applyTheme(initial, { persist: false })
+  }
+
+  function syncThemeFromStorage() {
+    const persisted = readPersistedTheme()
+    if (!persisted || persisted === theme.value) {
+      return
+    }
+    applyTheme(persisted, { persist: false })
   }
 
   function toggleTheme() {
@@ -130,6 +243,7 @@ export const useUiStore = defineStore('ui', () => {
     confirm,
     initTheme,
     setTheme,
+    syncThemeFromStorage,
     toggleTheme,
     toast,
     removeToast,

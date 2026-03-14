@@ -1,5 +1,6 @@
 import { computed, ref } from 'vue'
 import { defineStore } from 'pinia'
+import { isAxiosError } from 'axios'
 import api from '@/services/api'
 import { setSyncQueueUserScope } from '@/services/offlineSyncQueue'
 import {
@@ -31,7 +32,8 @@ interface LogoutAllResponse {
   session_driver: string
 }
 
-type AuthStatus = 'unknown' | 'checking' | 'authenticated' | 'guest'
+export type AuthStatus = 'unknown' | 'checking' | 'authenticated' | 'unauthenticated'
+type AuthBootstrapState = 'idle' | 'loading' | 'ready' | 'error'
 type AuthAction = 'idle' | 'login' | 'register' | 'logout' | 'logout_all'
 
 let unauthorizedListenerBound = false
@@ -39,24 +41,23 @@ let unauthorizedListenerBound = false
 export const useAuthStore = defineStore('auth', () => {
   const user = ref<AuthUser | null>(null)
   const status = ref<AuthStatus>('unknown')
+  const bootstrapState = ref<AuthBootstrapState>('idle')
+  const bootstrapError = ref<string | null>(null)
+  const sessionCheckedAt = ref<string | null>(null)
   const action = ref<AuthAction>('idle')
   const allowSelfRegister = ref(true)
-  const initialized = computed(() => status.value !== 'unknown' && status.value !== 'checking')
+  const initialized = computed(() => bootstrapState.value === 'ready' || bootstrapState.value === 'error')
   const loading = computed(() => status.value === 'checking' || action.value !== 'idle')
 
   const isAuthenticated = computed(() => status.value === 'authenticated')
   let initPromise: Promise<void> | null = null
+  let initializeRunId = 0
 
   async function clearSession() {
-    const previousUserId = user.value?.id ?? getScope().userId
-    purgeScopedStorageForUser(previousUserId)
-    await purgeLocalFallbackPersistenceForUser(previousUserId)
-    setScopeUserId(null)
-    setScopeAccountId(null)
-    user.value = null
-    setSyncQueueUserScope(null)
-    migrateLegacyLocalFallbackKeys()
-    status.value = 'guest'
+    await resetSessionState({ nextStatus: 'unauthenticated', purgeScopedData: true })
+    bootstrapError.value = null
+    bootstrapState.value = 'ready'
+    sessionCheckedAt.value = new Date().toISOString()
   }
 
   async function setUserScope(nextUser: AuthUser | null) {
@@ -69,7 +70,7 @@ export const useAuthStore = defineStore('auth', () => {
   }
 
   async function initialize(force = false) {
-    if (initialized.value && !force) {
+    if ((bootstrapState.value === 'ready' || bootstrapState.value === 'error') && !force) {
       return
     }
     if (initPromise && !force) {
@@ -82,18 +83,39 @@ export const useAuthStore = defineStore('auth', () => {
       unauthorizedListenerBound = true
     }
 
+    const runId = ++initializeRunId
     initPromise = (async () => {
+      bootstrapState.value = 'loading'
+      bootstrapError.value = null
       status.value = 'checking'
-      try {
-        await fetchAuthConfig()
-        await fetchMe()
-      } catch {
-        await clearSession()
-      } finally {
-        if (status.value === 'checking') {
-          status.value = user.value ? 'authenticated' : 'guest'
-        }
+      const [configResult, sessionResult] = await Promise.allSettled([
+        fetchAuthConfig(),
+        fetchSessionUser(),
+      ])
+
+      if (runId !== initializeRunId) {
+        return
       }
+
+      if (configResult.status === 'rejected') {
+        allowSelfRegister.value = true
+      }
+
+      if (sessionResult.status === 'fulfilled') {
+        await applyAuthenticatedUser(sessionResult.value, runId)
+        return
+      }
+
+      const failure = classifyBootstrapFailure(sessionResult.reason)
+      if (failure.kind === 'unauthenticated') {
+        await clearSession()
+        return
+      }
+
+      await resetSessionState({ nextStatus: 'unknown', purgeScopedData: false })
+      bootstrapError.value = failure.message
+      bootstrapState.value = 'error'
+      sessionCheckedAt.value = new Date().toISOString()
     })().finally(() => {
       initPromise = null
     })
@@ -102,10 +124,8 @@ export const useAuthStore = defineStore('auth', () => {
   }
 
   async function fetchMe() {
-    const { data } = await api.get<AuthUser>('/auth/me')
-    user.value = data
-    await setUserScope(data)
-    status.value = 'authenticated'
+    const data = await fetchSessionUser()
+    await applyAuthenticatedUser(data)
     return data
   }
 
@@ -174,6 +194,9 @@ export const useAuthStore = defineStore('auth', () => {
   return {
     user,
     status,
+    bootstrapState,
+    bootstrapError,
+    sessionCheckedAt,
     action,
     initialized,
     loading,
@@ -188,4 +211,97 @@ export const useAuthStore = defineStore('auth', () => {
     logoutAll,
     clearSession,
   }
+
+  async function fetchSessionUser(): Promise<AuthUser> {
+    const { data } = await api.get<AuthUser>('/auth/me')
+    return normalizeAuthUser(data)
+  }
+
+  async function applyAuthenticatedUser(nextUser: AuthUser, runId?: number) {
+    if (typeof runId === 'number' && runId !== initializeRunId) {
+      return nextUser
+    }
+
+    user.value = nextUser
+    await setUserScope(nextUser)
+    status.value = 'authenticated'
+    bootstrapError.value = null
+    bootstrapState.value = 'ready'
+    sessionCheckedAt.value = new Date().toISOString()
+    return nextUser
+  }
+
+  async function resetSessionState(options: {
+    nextStatus: Extract<AuthStatus, 'unknown' | 'unauthenticated'>
+    purgeScopedData: boolean
+  }) {
+    const previousUserId = user.value?.id ?? getScope().userId
+
+    user.value = null
+    status.value = options.nextStatus
+    setSyncQueueUserScope(null)
+
+    if (options.purgeScopedData) {
+      purgeScopedStorageForUser(previousUserId)
+      await purgeLocalFallbackPersistenceForUser(previousUserId)
+    }
+
+    setScopeUserId(null)
+    setScopeAccountId(null)
+    migrateLegacyLocalFallbackKeys()
+  }
 })
+
+function normalizeAuthUser(payload: unknown): AuthUser {
+  const source = (payload && typeof payload === 'object' ? payload : null) as Record<string, unknown> | null
+  const id = Number(source?.id)
+  const name = typeof source?.name === 'string' ? source.name.trim() : ''
+  const email = typeof source?.email === 'string' ? source.email.trim().toLowerCase() : ''
+
+  if (!Number.isInteger(id) || id <= 0 || name === '' || email === '') {
+    throw new Error('Invalid authenticated user payload.')
+  }
+
+  return {
+    id,
+    name,
+    email,
+  }
+}
+
+function classifyBootstrapFailure(error: unknown): {
+  kind: 'unauthenticated' | 'retryable'
+  message: string
+} {
+  if (isAxiosError(error)) {
+    const status = error.response?.status ?? 0
+    if (status === 401 || status === 419) {
+      return {
+        kind: 'unauthenticated',
+        message: 'Your session is no longer valid.',
+      }
+    }
+
+    if (!error.response) {
+      return {
+        kind: 'retryable',
+        message: error.code === 'ECONNABORTED'
+          ? 'Session check timed out. Please retry.'
+          : 'Unable to reach the API to verify your session. Check connectivity and try again.',
+      }
+    }
+
+    const payload = error.response.data
+    if (typeof payload === 'string' && /<(!doctype|html)/i.test(payload.trim())) {
+      return {
+        kind: 'retryable',
+        message: 'Session check returned HTML instead of JSON. Verify API routing and upstream configuration.',
+      }
+    }
+  }
+
+  return {
+    kind: 'retryable',
+    message: 'Unable to verify your session right now. Please retry.',
+  }
+}

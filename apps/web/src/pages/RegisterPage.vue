@@ -2,7 +2,7 @@
 import { computed, ref, watch } from 'vue'
 import { isAxiosError } from 'axios'
 import { RouterLink, useRoute, useRouter } from 'vue-router'
-import { Eye, EyeOff, LineChart, Sparkles } from 'lucide-vue-next'
+import { CheckCircle2, Eye, EyeOff, LineChart, Sparkles } from 'lucide-vue-next'
 import { useAuthStore } from '@/stores/authStore'
 import { useUserPreferencesStore } from '@/stores/userPreferencesStore'
 import { normalizeApiError } from '@/utils/apiError'
@@ -18,20 +18,77 @@ const password = ref('')
 const passwordConfirmation = ref('')
 const revealPassword = ref(false)
 const revealPasswordConfirmation = ref(false)
+const emailTouched = ref(false)
+const passwordTouched = ref(false)
+const passwordConfirmationTouched = ref(false)
 const errorMessage = ref<string | null>(null)
 
 const submitting = computed(() => authStore.loading)
 const allowSelfRegister = computed(() => authStore.allowSelfRegister)
+const normalizedEmail = computed(() => email.value.trim())
+const emailLooksValid = computed(() => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail.value))
+const emailError = computed(() => {
+  if (!emailTouched.value || normalizedEmail.value === '') return null
+  return emailLooksValid.value ? null : 'Enter a valid email address.'
+})
+const passwordLengthValid = computed(() => password.value.length >= 8)
+const passwordHasLetter = computed(() => /[A-Za-z]/.test(password.value))
+const passwordHasNumber = computed(() => /\d/.test(password.value))
+const passwordRuleText = computed(() => 'Use at least 8 characters. A mix of letters and numbers is recommended.')
+const passwordError = computed(() => {
+  if (!passwordTouched.value || password.value === '') return null
+  return passwordLengthValid.value ? null : 'Password must be at least 8 characters.'
+})
 const passwordMismatch = computed(() =>
   passwordConfirmation.value !== '' && password.value !== passwordConfirmation.value
 )
+const passwordConfirmationError = computed(() => {
+  if (!passwordConfirmationTouched.value || passwordConfirmation.value === '') return null
+  return passwordMismatch.value ? 'Passwords do not match.' : null
+})
+const passwordStrength = computed(() => {
+  const score = [
+    passwordLengthValid.value,
+    password.value.length >= 12,
+    passwordHasLetter.value,
+    passwordHasNumber.value,
+  ].filter(Boolean).length
+
+  if (password.value === '') {
+    return { label: 'Add a password', tone: 'empty', width: '0%' }
+  }
+  if (score <= 2) {
+    return { label: 'Basic', tone: 'weak', width: '34%' }
+  }
+  if (score === 3) {
+    return { label: 'Good', tone: 'medium', width: '68%' }
+  }
+  return { label: 'Strong', tone: 'strong', width: '100%' }
+})
 const canSubmit = computed(() =>
   name.value.trim() !== ''
-  && email.value.trim() !== ''
+  && normalizedEmail.value !== ''
+  && emailLooksValid.value
   && password.value.trim() !== ''
   && passwordConfirmation.value.trim() !== ''
+  && passwordLengthValid.value
   && !passwordMismatch.value
 )
+
+function onEmailInput(value: string) {
+  email.value = value
+  errorMessage.value = null
+}
+
+function onPasswordInput(value: string) {
+  password.value = value
+  errorMessage.value = null
+}
+
+function onPasswordConfirmationInput(value: string) {
+  passwordConfirmation.value = value
+  errorMessage.value = null
+}
 
 watch(allowSelfRegister, (enabled) => {
   if (!enabled) {
@@ -41,6 +98,9 @@ watch(allowSelfRegister, (enabled) => {
 
 async function submit() {
   errorMessage.value = null
+  emailTouched.value = true
+  passwordTouched.value = true
+  passwordConfirmationTouched.value = true
   if (!canSubmit.value) return
 
   try {
@@ -87,111 +147,190 @@ const loginLink = computed(() => {
 
 <template>
   <div class="auth-shell">
+    <a class="auth-skip-link" href="#register-main">Skip to account creation form</a>
     <div class="auth-grid-overlay" />
     <div class="auth-glow auth-glow-a" />
     <div class="auth-glow auth-glow-b" />
 
-    <div class="auth-shell-grid">
-      <aside class="auth-stage">
-        <div class="auth-brand-row">
+    <main id="register-main" class="auth-shell-grid" tabindex="-1">
+      <aside class="auth-stage" aria-labelledby="register-stage-title">
+        <a class="auth-brand-row" href="/" aria-label="IZLedger home">
           <span class="auth-brand-mark">
             <LineChart class="h-4 w-4" />
           </span>
           <span class="auth-brand-label">IZLedger</span>
-        </div>
+        </a>
 
         <p class="auth-stage-kicker">Workspace Setup</p>
-        <h1 class="auth-stage-title">Create your trader profile.</h1>
+        <h1 id="register-stage-title" class="auth-stage-title">Create your IZLedger workspace</h1>
         <p class="auth-stage-subtitle">
-          Start with a secure account and get a private environment for checklists, trade logs, and structured review.
+          Set up a private trading journal workspace built for execution review, rule-break tracking, and disciplined
+          session analysis.
         </p>
 
         <div class="auth-stage-metrics">
           <div class="metric-card">
             <small>Workspace</small>
-            <strong>Private</strong>
+            <strong>Private and secure</strong>
           </div>
           <div class="metric-card">
-            <small>Sync</small>
-            <strong>Enabled</strong>
+            <small>Setup time</small>
+            <strong>About 3 minutes</strong>
           </div>
         </div>
 
         <div class="auth-stage-note">
           <Sparkles class="h-4 w-4" />
-          <span>One account keeps your dashboards, reports, and settings consistent.</span>
+          <span>One account keeps your sessions, dashboards, rules, and review notes in one place.</span>
         </div>
       </aside>
 
-      <section class="auth-panel">
+      <section class="auth-panel" aria-labelledby="register-form-title">
         <header class="auth-panel-head">
           <p class="auth-kicker">Authentication</p>
-          <h2 class="auth-title">Create Account</h2>
-          <p class="auth-subtitle">Register your profile to start journaling.</p>
+          <h2 id="register-form-title" class="auth-title">Start free</h2>
+          <p id="register-form-help" class="auth-subtitle">Create your account to begin logging trades and reviewing execution with structure.</p>
         </header>
 
-        <form class="auth-form" @submit.prevent="submit">
-          <label class="auth-field">
+        <form class="auth-form" novalidate @submit.prevent="submit">
+          <label class="auth-field" for="register-name">
             <span class="auth-label">Name</span>
-            <input v-model.trim="name" class="auth-input" type="text" autocomplete="name" required />
+            <input
+              id="register-name"
+              v-model.trim="name"
+              class="auth-input"
+              type="text"
+              autocomplete="name"
+              aria-describedby="register-name-help"
+              required
+            />
+            <span id="register-name-help" class="auth-helper">Use the name you want attached to your workspace.</span>
           </label>
 
-          <label class="auth-field">
+          <label class="auth-field" for="register-email">
             <span class="auth-label">Email</span>
-            <input v-model.trim="email" class="auth-input" type="email" autocomplete="email" required />
+            <input
+              id="register-email"
+              :value="email"
+              class="auth-input"
+              :class="{ 'auth-input-error': emailError }"
+              type="email"
+              autocomplete="email"
+              inputmode="email"
+              :aria-invalid="emailError ? 'true' : 'false'"
+              :aria-describedby="emailError ? 'register-email-error' : undefined"
+              required
+              @input="onEmailInput(($event.target as HTMLInputElement).value)"
+              @blur="emailTouched = true"
+            />
+            <span v-if="emailError" id="register-email-error" class="auth-helper error" role="alert">{{ emailError }}</span>
           </label>
 
-          <label class="auth-field">
+          <label class="auth-field" for="register-password">
             <span class="auth-label">Password</span>
             <span class="auth-input-wrap">
               <input
-                v-model="password"
+                id="register-password"
                 class="auth-input with-toggle"
+                :class="{ 'auth-input-error': passwordError }"
+                :value="password"
                 :type="revealPassword ? 'text' : 'password'"
                 autocomplete="new-password"
+                :aria-invalid="passwordError ? 'true' : 'false'"
+                aria-describedby="register-password-help register-password-strength"
                 required
+                @input="onPasswordInput(($event.target as HTMLInputElement).value)"
+                @blur="passwordTouched = true"
               />
               <button
                 type="button"
                 class="auth-visibility-btn"
                 :aria-label="revealPassword ? 'Hide password' : 'Show password'"
+                :aria-pressed="revealPassword ? 'true' : 'false'"
                 @click="revealPassword = !revealPassword"
               >
                 <EyeOff v-if="revealPassword" class="h-4 w-4" />
                 <Eye v-else class="h-4 w-4" />
               </button>
             </span>
+            <span id="register-password-help" class="auth-helper">{{ passwordRuleText }}</span>
+            <span v-if="passwordError" id="register-password-error" class="auth-helper error" role="alert">{{ passwordError }}</span>
+
+            <div id="register-password-strength" class="password-strength" role="status" aria-live="polite" aria-label="Password strength">
+              <div class="password-strength-track">
+                <span :class="passwordStrength.tone" :style="{ width: passwordStrength.width }" />
+              </div>
+              <small :class="passwordStrength.tone">{{ passwordStrength.label }}</small>
+            </div>
           </label>
 
-          <label class="auth-field">
+          <label class="auth-field" for="register-password-confirmation">
             <span class="auth-label">Confirm Password</span>
             <span class="auth-input-wrap">
               <input
-                v-model="passwordConfirmation"
+                id="register-password-confirmation"
                 class="auth-input with-toggle"
-                :class="{ 'auth-input-error': passwordMismatch }"
+                :class="{ 'auth-input-error': passwordConfirmationError }"
+                :value="passwordConfirmation"
                 :type="revealPasswordConfirmation ? 'text' : 'password'"
                 autocomplete="new-password"
+                :aria-invalid="passwordConfirmationError ? 'true' : 'false'"
+                :aria-describedby="passwordConfirmationError ? 'register-password-confirmation-error' : 'register-password-confirmation-success'"
                 required
+                @input="onPasswordConfirmationInput(($event.target as HTMLInputElement).value)"
+                @blur="passwordConfirmationTouched = true"
               />
               <button
                 type="button"
                 class="auth-visibility-btn"
                 :aria-label="revealPasswordConfirmation ? 'Hide confirmation password' : 'Show confirmation password'"
+                :aria-pressed="revealPasswordConfirmation ? 'true' : 'false'"
                 @click="revealPasswordConfirmation = !revealPasswordConfirmation"
               >
                 <EyeOff v-if="revealPasswordConfirmation" class="h-4 w-4" />
                 <Eye v-else class="h-4 w-4" />
               </button>
             </span>
+            <span
+              v-if="passwordConfirmation !== '' && !passwordConfirmationError"
+              id="register-password-confirmation-success"
+              class="auth-helper success"
+              role="status"
+              aria-live="polite"
+            >
+              Passwords match.
+            </span>
+            <span
+              v-if="passwordConfirmationError"
+              id="register-password-confirmation-error"
+              class="auth-helper error"
+              role="alert"
+            >{{ passwordConfirmationError }}</span>
           </label>
 
-          <p v-if="passwordMismatch" class="auth-inline-error">Passwords do not match.</p>
-          <p v-if="errorMessage" class="auth-error">{{ errorMessage }}</p>
+          <p v-if="errorMessage" class="auth-error" role="alert">{{ errorMessage }}</p>
 
           <button type="submit" class="auth-submit" :disabled="submitting || !canSubmit">
-            {{ submitting ? 'Please wait...' : 'Create Account' }}
+            {{ submitting ? 'Creating workspace...' : 'Create Account' }}
           </button>
+
+          <div class="next-steps-card">
+            <small>What happens next</small>
+            <ol>
+              <li>
+                <CheckCircle2 class="h-4 w-4" />
+                <span>Set session preferences</span>
+              </li>
+              <li>
+                <CheckCircle2 class="h-4 w-4" />
+                <span>Log your first trades</span>
+              </li>
+              <li>
+                <CheckCircle2 class="h-4 w-4" />
+                <span>Review execution score</span>
+              </li>
+            </ol>
+          </div>
 
           <p class="auth-switch-link">
             Already have an account?
@@ -199,7 +338,7 @@ const loginLink = computed(() => {
           </p>
         </form>
       </section>
-    </div>
+    </main>
   </div>
 </template>
 
@@ -210,6 +349,27 @@ const loginLink = computed(() => {
   overflow: hidden;
   padding: 1.2rem;
   background: var(--bg);
+}
+
+.auth-skip-link {
+  position: absolute;
+  left: 1rem;
+  top: 1rem;
+  z-index: 3;
+  transform: translateY(-220%);
+  border-radius: 0.75rem;
+  background: color-mix(in srgb, var(--panel-strong) 92%, transparent 8%);
+  color: var(--text);
+  padding: 0.72rem 0.95rem;
+  font-weight: 700;
+  text-decoration: none;
+  box-shadow: var(--shadow-soft);
+}
+
+.auth-skip-link:focus-visible {
+  transform: translateY(0);
+  outline: 2px solid color-mix(in srgb, var(--primary) 60%, transparent 40%);
+  outline-offset: 2px;
 }
 
 .auth-grid-overlay {
@@ -269,16 +429,18 @@ const loginLink = computed(() => {
 }
 
 .auth-stage {
-  padding: 1.3rem;
+  padding: 1.45rem;
   display: grid;
   align-content: start;
-  gap: 0.9rem;
+  gap: 1rem;
 }
 
 .auth-brand-row {
   display: inline-flex;
   align-items: center;
   gap: 0.58rem;
+  width: fit-content;
+  text-decoration: none;
 }
 
 .auth-brand-mark {
@@ -319,9 +481,10 @@ const loginLink = computed(() => {
 
 .auth-stage-subtitle {
   margin: 0;
-  max-width: 40ch;
+  max-width: 42ch;
   color: var(--muted);
-  line-height: 1.62;
+  line-height: 1.68;
+  font-size: 0.98rem;
 }
 
 .auth-stage-metrics {
@@ -368,40 +531,42 @@ const loginLink = computed(() => {
 }
 
 .auth-panel {
-  padding: 1.15rem;
+  padding: 1.35rem;
   display: grid;
   align-content: start;
-  gap: 1rem;
+  gap: 1.15rem;
 }
 
 .auth-panel-head {
   display: grid;
-  gap: 0.28rem;
+  gap: 0.34rem;
 }
 
 .auth-title {
   margin: 0;
-  font-size: 1.45rem;
+  font-size: 1.56rem;
 }
 
 .auth-subtitle {
   margin: 0;
   color: var(--muted);
+  line-height: 1.6;
 }
 
 .auth-form {
   display: grid;
-  gap: 0.8rem;
+  gap: 0.95rem;
 }
 
 .auth-field {
   display: grid;
-  gap: 0.34rem;
+  gap: 0.42rem;
 }
 
 .auth-label {
   font-size: 0.82rem;
   color: var(--muted);
+  font-weight: 700;
 }
 
 .auth-input-wrap {
@@ -410,12 +575,12 @@ const loginLink = computed(() => {
 
 .auth-input {
   width: 100%;
-  min-height: 2.72rem;
-  border-radius: 0.72rem;
+  min-height: 2.92rem;
+  border-radius: 0.8rem;
   border: 1px solid color-mix(in srgb, var(--border) 74%, transparent 26%);
   background: color-mix(in srgb, var(--panel-soft) 74%, transparent 26%);
   color: var(--text);
-  padding: 0.64rem 0.8rem;
+  padding: 0.72rem 0.86rem;
 }
 
 .auth-input.with-toggle {
@@ -429,6 +594,8 @@ const loginLink = computed(() => {
 
 .auth-input-error {
   border-color: color-mix(in srgb, var(--danger) 58%, transparent 42%);
+  background: color-mix(in srgb, var(--danger) 8%, var(--panel-soft) 92%);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--danger) 10%, transparent 90%);
 }
 
 .auth-visibility-btn {
@@ -451,24 +618,41 @@ const loginLink = computed(() => {
   background: color-mix(in srgb, var(--panel-soft) 56%, transparent 44%);
 }
 
-.auth-inline-error {
-  margin: 0;
-  color: color-mix(in srgb, var(--danger) 78%, var(--text) 22%);
-  font-size: 0.84rem;
+.auth-brand-row:focus-visible,
+.auth-visibility-btn:focus-visible,
+.auth-submit:focus-visible,
+.auth-switch-link a:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--primary) 56%, transparent 44%);
+  outline-offset: 3px;
+}
+
+.auth-helper {
+  font-size: 0.8rem;
+  line-height: 1.45;
+  color: var(--muted);
+}
+
+.auth-helper.error {
+  color: color-mix(in srgb, var(--danger) 82%, var(--text) 18%);
+}
+
+.auth-helper.success {
+  color: color-mix(in srgb, var(--primary) 78%, var(--text) 22%);
 }
 
 .auth-error {
   margin: 0;
-  padding: 0.56rem 0.66rem;
-  border-radius: 0.68rem;
+  padding: 0.68rem 0.8rem;
+  border-radius: 0.8rem;
   border: 1px solid color-mix(in srgb, var(--danger) 45%, transparent 55%);
   background: color-mix(in srgb, var(--danger) 14%, transparent 86%);
   color: color-mix(in srgb, var(--danger) 78%, var(--text) 22%);
   font-size: 0.84rem;
+  line-height: 1.52;
 }
 
 .auth-submit {
-  min-height: 2.78rem;
+  min-height: 2.92rem;
   border: 0;
   border-radius: 0.8rem;
   font-weight: 700;
@@ -488,6 +672,95 @@ const loginLink = computed(() => {
 
 .auth-submit:disabled {
   opacity: 0.58;
+}
+
+.password-strength {
+  display: grid;
+  gap: 0.35rem;
+}
+
+.password-strength-track {
+  height: 0.42rem;
+  border-radius: 999px;
+  overflow: hidden;
+  background: color-mix(in srgb, var(--border) 60%, transparent 40%);
+}
+
+.password-strength-track span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+}
+
+.password-strength-track span.weak {
+  background: linear-gradient(90deg, color-mix(in srgb, var(--danger) 82%, #fff 18%), #f19f7d);
+}
+
+.password-strength-track span.medium {
+  background: linear-gradient(90deg, color-mix(in srgb, var(--warning) 78%, #fff 22%), #e9c06b);
+}
+
+.password-strength-track span.strong {
+  background: linear-gradient(90deg, color-mix(in srgb, var(--primary) 82%, #fff 18%), #76ddb0);
+}
+
+.password-strength small {
+  font-size: 0.78rem;
+  font-weight: 700;
+}
+
+.password-strength small.weak {
+  color: color-mix(in srgb, var(--danger) 82%, var(--text) 18%);
+}
+
+.password-strength small.medium {
+  color: color-mix(in srgb, var(--warning) 80%, var(--text) 20%);
+}
+
+.password-strength small.strong {
+  color: color-mix(in srgb, var(--primary) 80%, var(--text) 20%);
+}
+
+.password-strength small.empty {
+  color: var(--muted);
+}
+
+.next-steps-card {
+  border: 1px solid color-mix(in srgb, var(--border) 72%, transparent 28%);
+  border-radius: 0.92rem;
+  background: color-mix(in srgb, var(--panel-soft) 72%, transparent 28%);
+  padding: 0.9rem;
+}
+
+.next-steps-card small {
+  display: block;
+  color: color-mix(in srgb, var(--primary) 76%, var(--text) 24%);
+  font-size: 0.72rem;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.next-steps-card ol {
+  margin: 0.75rem 0 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 0.62rem;
+}
+
+.next-steps-card li {
+  display: flex;
+  align-items: center;
+  gap: 0.52rem;
+  color: var(--text);
+  font-size: 0.88rem;
+  font-weight: 600;
+}
+
+.next-steps-card svg {
+  color: var(--primary);
+  flex: 0 0 auto;
 }
 
 .auth-switch-link {
@@ -515,7 +788,7 @@ const loginLink = computed(() => {
 
   .auth-stage,
   .auth-panel {
-    padding: 1.4rem;
+    padding: 1.6rem;
   }
 }
 

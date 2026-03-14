@@ -1,4 +1,4 @@
-﻿<script setup lang="ts">
+<script setup lang="ts">
 import { computed, ref, watch } from 'vue'
 import { Check, ChevronDown, Info } from 'lucide-vue-next'
 import type {
@@ -9,6 +9,10 @@ import type {
   TradeChecklistResponseRecord,
 } from '@/types/rules'
 import { resolveChecklistLane, type ChecklistLaneKey } from '@/utils/rulesLanes'
+import {
+  resolveChecklistWorkflowFailures,
+  resolveChecklistWorkflowReadiness,
+} from '@/utils/tradeRuleWorkflow'
 
 interface RuleLane {
   key: ChecklistLaneKey
@@ -71,17 +75,31 @@ const allItems = computed(() =>
 
 const checkedCount = computed(() => allItems.value.filter((item) => item.response.is_completed).length)
 const totalCount = computed(() => allItems.value.length)
-const resolvedServerReadiness = computed(() => props.readiness)
+const resolvedServerReadiness = computed(() =>
+  resolveChecklistWorkflowReadiness({
+    readiness: props.readiness,
+    serverReadiness: props.serverReadiness,
+    executionSnapshot: props.executionSnapshot ?? null,
+  })
+)
 const serverStatusLabel = computed(() => resolvedServerReadiness.value.ready ? 'Ready' : 'Not Ready')
 const serverBlockingReasons = computed(() =>
-  props.readiness.missing_required.map((entry) => ({
-    checklist_item_id: entry.checklist_item_id,
-    title: entry.title,
-    category: entry.category,
-    reason: entry.reason ?? 'Rule requirement not met.',
-  }))
+  resolveChecklistWorkflowFailures({
+    readiness: props.readiness,
+    serverReadiness: props.serverReadiness,
+    serverReadinessReasons: props.serverReadinessReasons,
+    executionSnapshot: props.executionSnapshot ?? null,
+  })
 )
-const mismatchReasons = computed(() => serverBlockingReasons.value)
+const tradeRuleOutcomeLabel = computed(() =>
+  resolvedServerReadiness.value.ready ? 'This trade will be saved as rules followed.' : 'This trade will be saved with rule breaks.'
+)
+const failureReasonByItemId = computed(() =>
+  serverBlockingReasons.value.reduce((map, row) => {
+    map.set(row.checklist_item_id, row.reason ?? 'Rule requirement not met.')
+    return map
+  }, new Map<number, string>())
+)
 const snapshotFailedRows = computed(() => {
   const snapshot = props.executionSnapshot
   if (!snapshot || snapshot.failed_rule_ids.length === 0) return []
@@ -111,11 +129,19 @@ const laneItems = computed<Record<ChecklistLaneKey, TradeChecklistItemWithRespon
 })
 
 watch(
-  () => allItems.value,
+  () => [
+    allItems.value,
+    resolvedServerReadiness.value.ready,
+    serverBlockingReasons.value.map((entry) => entry.checklist_item_id).join(','),
+  ],
   () => {
+    const failedRequiredIds = serverBlockingReasons.value
+      .map((row) => row.checklist_item_id)
+      .filter((value) => Number.isInteger(value) && value > 0)
+
     emit('evaluation-change', {
-      failedRequiredIds: [],
-      firstFailingId: null,
+      failedRequiredIds,
+      firstFailingId: failedRequiredIds[0] ?? null,
     })
   },
   { immediate: true, deep: true }
@@ -226,6 +252,77 @@ function toggleItem(item: TradeChecklistItemWithResponse) {
 
   emit('update-response', item.id, item.response.is_completed ? '' : 'Done')
 }
+
+function numericInputValue(item: TradeChecklistItemWithResponse): string {
+  const value = toFiniteNumber(item.response.value)
+  return value === null ? '' : String(value)
+}
+
+function textInputValue(item: TradeChecklistItemWithResponse): string {
+  if (item.response.value === null || item.response.value === undefined) return ''
+  return String(item.response.value)
+}
+
+function setTextValue(item: TradeChecklistItemWithResponse, value: string) {
+  emit('update-response', item.id, value)
+}
+
+function setNumericValue(item: TradeChecklistItemWithResponse, value: string) {
+  emit('update-response', item.id, value.trim() === '' ? null : Number(value))
+}
+
+function handleDropdownChange(item: TradeChecklistItemWithResponse, event: Event) {
+  const target = event.target
+  if (!(target instanceof HTMLSelectElement)) return
+  setTextValue(item, target.value)
+}
+
+function handleNumberInput(item: TradeChecklistItemWithResponse, event: Event) {
+  const target = event.target
+  if (!(target instanceof HTMLInputElement)) return
+  setNumericValue(item, target.value)
+}
+
+function handleTextInput(item: TradeChecklistItemWithResponse, event: Event) {
+  const target = event.target
+  if (!(target instanceof HTMLTextAreaElement)) return
+  setTextValue(item, target.value)
+}
+
+function itemMin(item: TradeChecklistItemWithResponse): number | undefined {
+  const config = item.config as { min?: unknown }
+  const parsed = toFiniteNumber(config.min)
+  return parsed === null ? undefined : parsed
+}
+
+function itemMax(item: TradeChecklistItemWithResponse): number | undefined {
+  const config = item.config as { max?: unknown }
+  const parsed = toFiniteNumber(config.max)
+  return parsed === null ? undefined : parsed
+}
+
+function itemStep(item: TradeChecklistItemWithResponse): number | undefined {
+  return numericStepFor(item)
+}
+
+function itemAutoMetricLabel(item: TradeChecklistItemWithResponse): string {
+  const config = item.config as { auto_metric?: unknown; rule?: unknown }
+  const directMetric = typeof config.auto_metric === 'string' ? config.auto_metric.trim() : ''
+  if (directMetric) return directMetric
+
+  if (typeof config.rule === 'object' && config.rule !== null) {
+    const ruleMetric = typeof (config.rule as { metric_key?: unknown }).metric_key === 'string'
+      ? String((config.rule as { metric_key?: unknown }).metric_key).trim()
+      : ''
+    if (ruleMetric) return ruleMetric
+  }
+
+  return ''
+}
+
+function rowFailureReason(itemId: number): string {
+  return failureReasonByItemId.value.get(itemId) ?? ''
+}
 </script>
 
 <template>
@@ -255,6 +352,7 @@ function toggleItem(item: TradeChecklistItemWithResponse) {
             <strong>Rules status:</strong>
             <span :class="resolvedServerReadiness.ready ? 'is-ready' : 'is-not-ready'">{{ serverStatusLabel }}</span>
           </p>
+          <p class="rules-server-outcome">{{ tradeRuleOutcomeLabel }}</p>
           <div
             v-if="strictMode && !resolvedServerReadiness.ready && serverBlockingReasons.length > 0"
             class="rules-server-blocked"
@@ -268,10 +366,10 @@ function toggleItem(item: TradeChecklistItemWithResponse) {
               {{ row.title }}: {{ row.reason || 'Rule requirement not met.' }}
             </p>
           </div>
-          <div v-if="serverReadinessMismatch && mismatchReasons.length > 0" class="rules-server-mismatch">
+          <div v-if="serverReadinessMismatch && serverBlockingReasons.length > 0" class="rules-server-mismatch">
             <p class="rules-server-mismatch-title">Local edits differ from server evaluation</p>
             <p
-              v-for="row in mismatchReasons"
+              v-for="row in serverBlockingReasons"
               :key="`server-mismatch-${row.checklist_item_id}`"
               class="rules-server-mismatch-row"
             >
@@ -290,19 +388,92 @@ function toggleItem(item: TradeChecklistItemWithResponse) {
             No rules in this phase yet.
           </p>
 
-          <button
+          <article
             v-for="item in laneItems[lane.key]"
             :key="item.id"
-            type="button"
             class="rules-item"
-            :class="{ checked: item.response.is_completed }"
-            @click="toggleItem(item)"
+            :class="{ checked: item.response.is_completed, 'has-failure': rowFailureReason(item.id) }"
           >
-            <span class="rules-item-box" :class="{ checked: item.response.is_completed }">
-              <Check class="h-3.5 w-3.5" />
-            </span>
-            <span class="rules-item-text">{{ item.title }}</span>
-          </button>
+            <div class="rules-item-head">
+              <button
+                type="button"
+                class="rules-item-box"
+                :class="{ checked: item.response.is_completed }"
+                @click="toggleItem(item)"
+              >
+                <Check class="h-3.5 w-3.5" />
+              </button>
+
+              <div class="rules-item-copy">
+                <div class="rules-item-title-row">
+                  <span class="rules-item-text">{{ item.title }}</span>
+                  <span class="rules-item-badge" :class="item.required ? 'is-required' : 'is-optional'">
+                    {{ item.required ? 'Required' : 'Optional' }}
+                  </span>
+                  <span v-if="itemAutoMetricLabel(item)" class="rules-item-badge is-metric">
+                    Auto: {{ itemAutoMetricLabel(item) }}
+                  </span>
+                </div>
+                <p v-if="item.help_text" class="rules-item-help">{{ item.help_text }}</p>
+              </div>
+            </div>
+
+            <div class="rules-item-control">
+              <button
+                v-if="item.type === 'checkbox'"
+                type="button"
+                class="rules-toggle-btn"
+                :class="{ checked: item.response.is_completed }"
+                @click="toggleItem(item)"
+              >
+                {{ item.response.is_completed ? 'Followed' : 'Mark Followed' }}
+              </button>
+
+              <select
+                v-else-if="item.type === 'dropdown'"
+                class="rules-select"
+                :value="textInputValue(item)"
+                @change="handleDropdownChange(item, $event)"
+              >
+                <option value="">Select an option</option>
+                <option v-for="option in dropdownOptions(item)" :key="`${item.id}-${option}`" :value="option">
+                  {{ option }}
+                </option>
+              </select>
+
+              <input
+                v-else-if="item.type === 'number' || item.type === 'scale'"
+                class="rules-number-input"
+                type="number"
+                :min="itemMin(item)"
+                :max="itemMax(item)"
+                :step="itemStep(item)"
+                :value="numericInputValue(item)"
+                @input="handleNumberInput(item, $event)"
+              />
+
+              <textarea
+                v-else
+                class="rules-textarea"
+                rows="2"
+                :value="textInputValue(item)"
+                @input="handleTextInput(item, $event)"
+              />
+
+              <button
+                v-if="item.type !== 'checkbox' && item.response.is_completed"
+                type="button"
+                class="rules-clear-btn"
+                @click="toggleItem(item)"
+              >
+                Clear
+              </button>
+            </div>
+
+            <p v-if="rowFailureReason(item.id)" class="rules-item-reason">
+              {{ rowFailureReason(item.id) }}
+            </p>
+          </article>
         </section>
       </div>
 
@@ -390,7 +561,7 @@ function toggleItem(item: TradeChecklistItemWithResponse) {
 }
 
 .rules-card-body {
-  max-height: 360px;
+  max-height: 420px;
   overflow: auto;
   padding: 0.72rem 0.78rem 0.8rem;
   display: grid;
@@ -430,31 +601,19 @@ function toggleItem(item: TradeChecklistItemWithResponse) {
   font-weight: 700;
 }
 
-.rules-server-mismatch {
-  display: grid;
-  gap: 0.2rem;
+.rules-server-outcome {
+  margin: 0;
+  font-size: 0.72rem;
+  color: var(--muted);
 }
 
+.rules-server-mismatch,
 .rules-server-blocked {
   display: grid;
   gap: 0.2rem;
 }
 
-.rules-server-blocked-title {
-  margin: 0;
-  font-size: 0.68rem;
-  font-weight: 700;
-  color: color-mix(in srgb, var(--danger) 66%, var(--text) 34%);
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-}
-
-.rules-server-blocked-row {
-  margin: 0;
-  font-size: 0.7rem;
-  color: var(--muted);
-}
-
+.rules-server-blocked-title,
 .rules-server-mismatch-title {
   margin: 0;
   font-size: 0.68rem;
@@ -464,6 +623,7 @@ function toggleItem(item: TradeChecklistItemWithResponse) {
   letter-spacing: 0.04em;
 }
 
+.rules-server-blocked-row,
 .rules-server-mismatch-row {
   margin: 0;
   font-size: 0.7rem;
@@ -494,15 +654,27 @@ function toggleItem(item: TradeChecklistItemWithResponse) {
 }
 
 .rules-item {
-  width: 100%;
-  border: none;
-  background: transparent;
+  border: 1px solid color-mix(in srgb, var(--border) 68%, transparent 32%);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--panel-soft) 68%, var(--panel) 32%);
   color: var(--text);
-  padding: 0.12rem 0;
-  display: flex;
-  align-items: center;
+  padding: 0.58rem 0.62rem;
+  display: grid;
   gap: 0.55rem;
-  text-align: left;
+}
+
+.rules-item.checked {
+  border-color: color-mix(in srgb, var(--primary) 55%, var(--border) 45%);
+}
+
+.rules-item.has-failure {
+  border-color: color-mix(in srgb, var(--danger) 48%, var(--border) 52%);
+}
+
+.rules-item-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.55rem;
 }
 
 .rules-item-box {
@@ -523,13 +695,101 @@ function toggleItem(item: TradeChecklistItemWithResponse) {
   color: var(--panel);
 }
 
-.rules-item-text {
-  font-size: 1.03rem;
-  line-height: 1.25;
+.rules-item-copy {
+  min-width: 0;
+  display: grid;
+  gap: 0.24rem;
 }
 
-.rules-item.checked .rules-item-text {
-  color: color-mix(in srgb, var(--primary) 64%, var(--text) 36%);
+.rules-item-title-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.36rem;
+}
+
+.rules-item-text {
+  font-size: 0.83rem;
+  line-height: 1.35;
+  font-weight: 700;
+}
+
+.rules-item-help {
+  margin: 0;
+  font-size: 0.7rem;
+  color: var(--muted);
+}
+
+.rules-item-badge {
+  border-radius: 999px;
+  padding: 0.12rem 0.42rem;
+  font-size: 0.64rem;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.rules-item-badge.is-required {
+  background: color-mix(in srgb, var(--danger) 14%, transparent 86%);
+  color: color-mix(in srgb, var(--danger) 76%, var(--text) 24%);
+}
+
+.rules-item-badge.is-optional {
+  background: color-mix(in srgb, var(--border) 28%, transparent 72%);
+  color: var(--muted);
+}
+
+.rules-item-badge.is-metric {
+  background: color-mix(in srgb, var(--primary) 14%, transparent 86%);
+  color: color-mix(in srgb, var(--primary) 78%, var(--text) 22%);
+}
+
+.rules-item-control {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.45rem;
+  padding-left: 1.63rem;
+}
+
+.rules-toggle-btn,
+.rules-clear-btn {
+  border: 1px solid color-mix(in srgb, var(--border) 70%, transparent 30%);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text);
+  padding: 0.3rem 0.58rem;
+  font-size: 0.7rem;
+  font-weight: 700;
+}
+
+.rules-toggle-btn.checked {
+  background: color-mix(in srgb, var(--primary) 15%, transparent 85%);
+  border-color: color-mix(in srgb, var(--primary) 54%, transparent 46%);
+}
+
+.rules-select,
+.rules-number-input,
+.rules-textarea {
+  width: 100%;
+  border-radius: 8px;
+  border: 1px solid color-mix(in srgb, var(--border) 74%, transparent 26%);
+  background: color-mix(in srgb, var(--panel) 88%, white 12%);
+  color: var(--text);
+  padding: 0.45rem 0.55rem;
+  font-size: 0.74rem;
+}
+
+.rules-textarea {
+  min-height: 3.2rem;
+  resize: vertical;
+}
+
+.rules-item-reason {
+  margin: 0;
+  padding-left: 1.63rem;
+  font-size: 0.7rem;
+  color: color-mix(in srgb, var(--danger) 68%, var(--text) 32%);
 }
 
 .rules-saving,

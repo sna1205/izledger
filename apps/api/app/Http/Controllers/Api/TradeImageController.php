@@ -38,13 +38,22 @@ class TradeImageController extends Controller
     {
         $this->authorize('update', $trade);
 
-        $validated = Validator::make($request->all(), [
-            'image' => ['required', 'file', 'max:' . self::MAX_FILE_KB, 'mimes:jpg,jpeg,png,webp,bmp'],
-            'sort_order' => ['nullable', 'integer', 'min:0'],
-            'context_tag' => ['nullable', 'in:' . implode(',', self::CONTEXT_TAGS)],
-            'timeframe' => ['nullable', 'string', 'max:20'],
-            'annotation_notes' => ['nullable', 'string', 'max:2000'],
-        ])->validate();
+        $validated = Validator::make(
+            $request->all(),
+            [
+                'image' => ['required', 'file', 'max:' . self::MAX_FILE_KB, 'mimes:jpg,jpeg,png,webp,bmp'],
+                'sort_order' => ['nullable', 'integer', 'min:0'],
+                'context_tag' => ['nullable', 'in:' . implode(',', self::CONTEXT_TAGS)],
+                'timeframe' => ['nullable', 'string', 'max:20'],
+                'annotation_notes' => ['nullable', 'string', 'max:2000'],
+            ],
+            [
+                'image.required' => 'Image upload is required.',
+                'image.file' => 'Uploaded screenshot must be a file.',
+                'image.max' => 'Each image must be 5MB or smaller.',
+                'image.mimes' => 'Only jpg, jpeg, png, webp, and bmp files are allowed.',
+            ]
+        )->validate();
 
         $file = $request->file('image');
         if (!$file instanceof UploadedFile) {

@@ -32,6 +32,13 @@ import { useReportStore } from '@/stores/reportStore'
 import { useTradeStore } from '@/stores/tradeStore'
 import { useUiStore } from '@/stores/uiStore'
 import { asDate, asSignedCurrency } from '@/utils/format'
+import {
+  buildTradeQualityQuery,
+  isTradeQualityQueryCanonical,
+  resolveTradeQualityRoutePreference,
+  resolveTradeQualitySearchPreference,
+  TRADE_QUALITY_QUERY_KEY,
+} from '@/utils/tradeQualityRoute'
 import type { Trade, TradeImage, TradePsychology } from '@/types/trade'
 
 const router = useRouter()
@@ -65,6 +72,7 @@ const lightboxOpen = ref(false)
 const activeDetailImage = computed(() => detailsImages.value[detailImageIndex.value] ?? null)
 const activeDetailImageSrc = computed(() => resolveImageSrc(activeDetailImage.value))
 const filtersExpanded = ref(false)
+const tradeQualityRouteReady = ref(false)
 const selectedSavedReportId = ref('')
 type TradeQuickFocus = 'all' | 'needs_review' | 'rule_breaks' | 'losers' | 'no_screenshot'
 const quickFocus = ref<TradeQuickFocus>('all')
@@ -174,6 +182,7 @@ const heavyContentReadyByTradeId = ref<Record<number, true>>({})
 let virtualResizeObserver: ResizeObserver | null = null
 let heavyContentObserver: IntersectionObserver | null = null
 const tradeCardElements = new Map<number, Element>()
+let syncingTradeQualityRoute = false
 
 const shouldVirtualizeTrades = computed(() =>
   !loading.value && visibleTrades.value.length > VIRTUALIZATION_THRESHOLD
@@ -530,8 +539,51 @@ function openEditPage(trade: Trade) {
 }
 
 async function toggleIncludeDraftsUnverified() {
-  tradeStore.setIncludeDraftsUnverified(!includeDraftsUnverified.value)
+  const next = !includeDraftsUnverified.value
+  tradeStore.setIncludeDraftsUnverified(next)
+  await router.push({
+    query: buildTradeQualityQuery(route.query, next),
+  })
   await tradeStore.fetchTrades(1)
+}
+
+function syncTradeQualityFromRoute(fallbackIncludeDraftsUnverified: boolean): boolean {
+  const next = resolveTradeQualityRoutePreference(route.query, fallbackIncludeDraftsUnverified)
+  tradeStore.setIncludeDraftsUnverified(next)
+  return next
+}
+
+function tradeQualityQuerySignature(): string {
+  const rawValue = route.query[TRADE_QUALITY_QUERY_KEY]
+  if (Array.isArray(rawValue)) {
+    return rawValue.join('|')
+  }
+
+  return typeof rawValue === 'string' ? rawValue : ''
+}
+
+async function syncTradeQualityAfterRouteChange() {
+  if (!tradeQualityRouteReady.value || syncingTradeQualityRoute) return
+
+  syncingTradeQualityRoute = true
+
+  try {
+    const previous = includeDraftsUnverified.value
+    await nextTick()
+    const next = syncTradeQualityFromRoute(false)
+
+    if (!isTradeQualityQueryCanonical(route.query, next)) {
+      await router.replace({
+        query: buildTradeQualityQuery(route.query, next),
+      })
+      return
+    }
+
+    if (previous === next) return
+    await tradeStore.fetchTrades(1)
+  } finally {
+    syncingTradeQualityRoute = false
+  }
 }
 
 async function openDetails(trade: Trade) {
@@ -860,8 +912,22 @@ async function applySavedView(reportId: string) {
   if (savedFilters.include_drafts_unverified !== undefined) {
     const next = String(savedFilters.include_drafts_unverified) === 'true' || String(savedFilters.include_drafts_unverified) === '1'
     tradeStore.setIncludeDraftsUnverified(next)
+    await router.replace({
+      query: buildTradeQualityQuery(route.query, next),
+    })
   }
   await applyFilters()
+}
+
+function handleHistoryNavigation() {
+  if (!tradeQualityRouteReady.value) return
+
+  const previous = includeDraftsUnverified.value
+  const next = resolveTradeQualitySearchPreference(window.location.search, false)
+  tradeStore.setIncludeDraftsUnverified(next)
+
+  if (previous === next) return
+  void tradeStore.fetchTrades(1)
 }
 
 function exportCurrentCsv() {
@@ -893,8 +959,14 @@ function pruneDetachedTradeCards(activeTradeIds: number[]) {
 
 onMounted(async () => {
   window.addEventListener('keydown', handleLightboxKeydown)
+  window.addEventListener('popstate', handleHistoryNavigation)
   try {
-    tradeStore.refreshTradeQualityPreference()
+    const initialIncludeDraftsUnverified = syncTradeQualityFromRoute(false)
+    if (!isTradeQualityQueryCanonical(route.query, initialIncludeDraftsUnverified)) {
+      await router.replace({
+        query: buildTradeQualityQuery(route.query, initialIncludeDraftsUnverified),
+      })
+    }
     await Promise.all([
       tradeStore.fetchInstruments(),
       tradeStore.fetchDictionaries(),
@@ -909,15 +981,25 @@ onMounted(async () => {
       title: 'Failed to load trade log',
       message: 'Please refresh and try again.',
     })
+  } finally {
+    tradeQualityRouteReady.value = true
   }
 })
 
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', handleLightboxKeydown)
+  window.removeEventListener('popstate', handleHistoryNavigation)
   disconnectVirtualResizeObserver()
   disconnectHeavyContentObserver()
   tradeCardElements.clear()
 })
+
+watch(
+  () => tradeQualityQuerySignature(),
+  () => {
+    void syncTradeQualityAfterRouteChange()
+  }
+)
 
 watch(
   () => route.query.focus,

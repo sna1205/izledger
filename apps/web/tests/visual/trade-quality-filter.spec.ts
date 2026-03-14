@@ -2,6 +2,8 @@ import { expect, test } from '@playwright/test'
 
 const scopedAccountsKey = 'tj:v3:u:anon:a:all:local-fallback:accounts_v1'
 const scopedTradesKey = 'tj:v3:u:anon:a:all:local-fallback:trades_v1'
+const authedAccountsKey = 'tj:v3:u:99:a:all:local-fallback:accounts_v1'
+const authedTradesKey = 'tj:v3:u:99:a:all:local-fallback:trades_v1'
 const offlineModeKey = 'tj_offline_mode_enabled'
 
 const seededAccounts = [
@@ -101,34 +103,85 @@ function envelope<T>(data: T) {
 
 test.beforeEach(async ({ page }) => {
   await page.route('**/api/**', async (route) => {
+    const url = new URL(route.request().url())
+
+    if (url.pathname.endsWith('/auth/config')) {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ allow_self_register: true }),
+      })
+      return
+    }
+
+    if (url.pathname.endsWith('/auth/me')) {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          id: 99,
+          name: 'Visual QA',
+          email: 'visual@example.com',
+        }),
+      })
+      return
+    }
+
     await route.abort('failed')
   })
 
   await page.addInitScript(
-    ({ accounts, trades, accountsKey, tradesKey, offlineKey }) => {
+    ({ accounts, trades, accountKeys, tradeKeys, offlineKey }) => {
       localStorage.setItem(offlineKey, '1')
-      localStorage.setItem(accountsKey, accounts)
-      localStorage.setItem(tradesKey, trades)
+      for (const key of accountKeys) {
+        localStorage.setItem(key, accounts)
+      }
+      for (const key of tradeKeys) {
+        localStorage.setItem(key, trades)
+      }
     },
     {
       accounts: envelope(seededAccounts),
       trades: envelope(seededTrades),
-      accountsKey: scopedAccountsKey,
-      tradesKey: scopedTradesKey,
+      accountKeys: [scopedAccountsKey, authedAccountsKey],
+      tradeKeys: [scopedTradesKey, authedTradesKey],
       offlineKey: offlineModeKey,
     }
   )
   await page.goto('/__visual-regression?visual=1')
 })
 
-test('trade log excludes drafts/unverified by default and includes them when toggled', async ({ page }) => {
+test('trade log toggle syncs visible results and survives refresh', async ({ page }) => {
   await page.goto('/trades?visual=1')
   await page.waitForLoadState('networkidle')
 
   await expect(page.getByTestId('trade-log-page')).toBeVisible()
   await expect(page.getByText('EURUSD').first()).toBeVisible()
   await expect(page.getByText('GBPUSD')).toHaveCount(0)
+  await expect(page).not.toHaveURL(/include_drafts_unverified=1/)
 
   await page.getByTestId('trade-quality-toggle').click()
+  await expect(page).toHaveURL(/include_drafts_unverified=1/)
   await expect(page.getByText('GBPUSD').first()).toBeVisible()
+
+  await page.reload()
+  await page.waitForLoadState('networkidle')
+  await expect(page).toHaveURL(/include_drafts_unverified=1/)
+  await expect(page.getByText('GBPUSD').first()).toBeVisible()
+})
+
+test('trade log toggle restores prior quality filter on browser back', async ({ page }) => {
+  await page.goto('/trades?visual=1')
+  await page.waitForLoadState('networkidle')
+
+  await expect(page.getByText('GBPUSD')).toHaveCount(0)
+
+  await page.getByTestId('trade-quality-toggle').click()
+  await expect(page).toHaveURL(/include_drafts_unverified=1/)
+  await expect(page.getByText('GBPUSD').first()).toBeVisible()
+
+  await page.goBack()
+  await page.waitForLoadState('networkidle')
+  await expect(page).not.toHaveURL(/include_drafts_unverified=1/)
+  await expect(page.getByText('GBPUSD')).toHaveCount(0)
 })

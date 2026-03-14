@@ -2,7 +2,7 @@
 import { computed, ref } from 'vue'
 import { isAxiosError } from 'axios'
 import { RouterLink, useRoute, useRouter } from 'vue-router'
-import { Eye, EyeOff, LineChart, Sparkles } from 'lucide-vue-next'
+import { Eye, EyeOff, LineChart, LockKeyhole, ShieldCheck, Sparkles } from 'lucide-vue-next'
 import { useAuthStore } from '@/stores/authStore'
 import { useUserPreferencesStore } from '@/stores/userPreferencesStore'
 import { normalizeApiError } from '@/utils/apiError'
@@ -15,14 +15,44 @@ const userPreferencesStore = useUserPreferencesStore()
 const email = ref('')
 const password = ref('')
 const revealPassword = ref(false)
+const emailTouched = ref(false)
 const errorMessage = ref<string | null>(null)
+const recoveryMessage = ref<string | null>(null)
 
 const allowSelfRegister = computed(() => authStore.allowSelfRegister)
 const submitting = computed(() => authStore.loading)
-const canSubmit = computed(() => email.value.trim() !== '' && password.value.trim() !== '')
+const normalizedEmail = computed(() => email.value.trim())
+const emailLooksValid = computed(() => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail.value))
+const emailError = computed(() => {
+  if (!emailTouched.value || normalizedEmail.value === '') return null
+  return emailLooksValid.value ? null : 'Enter a valid email address.'
+})
+const canSubmit = computed(() => normalizedEmail.value !== '' && emailLooksValid.value && password.value.trim() !== '')
+
+function onEmailInput(value: string) {
+  email.value = value
+  errorMessage.value = null
+  recoveryMessage.value = null
+}
+
+function onPasswordInput(value: string) {
+  password.value = value
+  errorMessage.value = null
+}
+
+function onEmailBlur() {
+  emailTouched.value = true
+}
+
+function onForgotPassword() {
+  recoveryMessage.value = 'Password reset support is coming soon. Please contact support or your workspace owner for help regaining access.'
+  errorMessage.value = null
+}
 
 async function submit() {
   errorMessage.value = null
+  recoveryMessage.value = null
+  emailTouched.value = true
   if (!canSubmit.value) return
 
   try {
@@ -49,6 +79,7 @@ async function submit() {
       }
 
       errorMessage.value = normalizeApiError(error).message
+      emailTouched.value = true
       return
     }
 
@@ -69,33 +100,35 @@ const registerLink = computed(() => {
 
 <template>
   <div class="auth-shell">
+    <a class="auth-skip-link" href="#auth-main">Skip to sign in form</a>
     <div class="auth-grid-overlay" />
     <div class="auth-glow auth-glow-a" />
     <div class="auth-glow auth-glow-b" />
 
-    <div class="auth-shell-grid">
-      <aside class="auth-stage">
-        <div class="auth-brand-row">
+    <main id="auth-main" class="auth-shell-grid" tabindex="-1">
+      <aside class="auth-stage" aria-labelledby="login-stage-title">
+        <a class="auth-brand-row" href="/" aria-label="IZLedger home">
           <span class="auth-brand-mark">
             <LineChart class="h-4 w-4" />
           </span>
           <span class="auth-brand-label">IZLedger</span>
-        </div>
+        </a>
 
-        <p class="auth-stage-kicker">Session Access</p>
-        <h1 class="auth-stage-title">Back to your execution desk.</h1>
+        <p class="auth-stage-kicker">Secure Workspace</p>
+        <h1 id="login-stage-title" class="auth-stage-title">Welcome back</h1>
         <p class="auth-stage-subtitle">
-          Continue with your account-scoped journals, checklists, and analytics to keep your process consistent.
+          Sign in to your secure trading journal workspace. Access your trades, rule breaks, and execution analytics
+          in one place.
         </p>
 
         <div class="auth-stage-metrics">
           <div class="metric-card">
-            <small>Review Loop</small>
-            <strong>Active</strong>
+            <small>Workspace</small>
+            <strong>Private by user</strong>
           </div>
           <div class="metric-card">
-            <small>Theme</small>
-            <strong>Dark</strong>
+            <small>Review focus</small>
+            <strong>Execution and discipline</strong>
           </div>
         </div>
 
@@ -105,46 +138,85 @@ const registerLink = computed(() => {
         </div>
       </aside>
 
-      <section class="auth-panel">
+      <section class="auth-panel" aria-labelledby="login-form-title">
         <header class="auth-panel-head">
           <p class="auth-kicker">Authentication</p>
-          <h2 class="auth-title">Sign In</h2>
-          <p class="auth-subtitle">Enter your credentials to continue.</p>
+          <h2 id="login-form-title" class="auth-title">Sign in to continue</h2>
+          <p id="login-form-help" class="auth-subtitle">Keep login simple and get straight back to your review workflow.</p>
         </header>
 
-        <form class="auth-form" @submit.prevent="submit">
-          <label class="auth-field">
+        <form class="auth-form" novalidate @submit.prevent="submit">
+          <label class="auth-field" for="login-email">
             <span class="auth-label">Email</span>
-            <input v-model.trim="email" class="auth-input" type="email" autocomplete="email" required />
+            <input
+              id="login-email"
+              :value="email"
+              class="auth-input"
+              :class="{ invalid: emailError }"
+              type="email"
+              autocomplete="email"
+              inputmode="email"
+              :aria-invalid="emailError ? 'true' : 'false'"
+              :aria-describedby="emailError ? 'login-email-error' : undefined"
+              required
+              @input="onEmailInput(($event.target as HTMLInputElement).value)"
+              @blur="onEmailBlur"
+            />
+            <span v-if="emailError" id="login-email-error" class="auth-field-note error" role="alert">{{ emailError }}</span>
           </label>
 
-          <label class="auth-field">
+          <label class="auth-field" for="login-password">
             <span class="auth-label">Password</span>
             <span class="auth-input-wrap">
               <input
-                v-model="password"
+                id="login-password"
                 class="auth-input with-toggle"
+                :value="password"
                 :type="revealPassword ? 'text' : 'password'"
                 autocomplete="current-password"
+                aria-describedby="login-password-help"
                 required
+                @input="onPasswordInput(($event.target as HTMLInputElement).value)"
               />
               <button
                 type="button"
                 class="auth-visibility-btn"
                 :aria-label="revealPassword ? 'Hide password' : 'Show password'"
+                :aria-pressed="revealPassword ? 'true' : 'false'"
                 @click="revealPassword = !revealPassword"
               >
                 <EyeOff v-if="revealPassword" class="h-4 w-4" />
                 <Eye v-else class="h-4 w-4" />
               </button>
             </span>
+            <span id="login-password-help" class="auth-field-note">Use the password linked to this workspace.</span>
           </label>
 
-          <p v-if="errorMessage" class="auth-error">{{ errorMessage }}</p>
+          <div class="auth-form-meta">
+            <button type="button" class="auth-inline-link" @click="onForgotPassword">Forgot password?</button>
+          </div>
+
+          <p v-if="recoveryMessage" class="auth-note" role="status" aria-live="polite">{{ recoveryMessage }}</p>
+          <p v-if="errorMessage" class="auth-error" role="alert">{{ errorMessage }}</p>
 
           <button type="submit" class="auth-submit" :disabled="submitting || !canSubmit">
-            {{ submitting ? 'Please wait...' : 'Sign In' }}
+            {{ submitting ? 'Signing in...' : 'Sign In' }}
           </button>
+
+          <div class="auth-security-row" aria-label="Security reassurances">
+            <span>
+              <ShieldCheck class="h-4 w-4" />
+              Encrypted in transit
+            </span>
+            <span>
+              <LockKeyhole class="h-4 w-4" />
+              Private workspace per user
+            </span>
+            <span>
+              <Sparkles class="h-4 w-4" />
+              2FA coming soon
+            </span>
+          </div>
 
           <p v-if="allowSelfRegister" class="auth-switch-link">
             Need an account?
@@ -152,7 +224,7 @@ const registerLink = computed(() => {
           </p>
         </form>
       </section>
-    </div>
+    </main>
   </div>
 </template>
 
@@ -163,6 +235,27 @@ const registerLink = computed(() => {
   overflow: hidden;
   padding: 1.2rem;
   background: var(--bg);
+}
+
+.auth-skip-link {
+  position: absolute;
+  left: 1rem;
+  top: 1rem;
+  z-index: 3;
+  transform: translateY(-220%);
+  border-radius: 0.75rem;
+  background: color-mix(in srgb, var(--panel-strong) 92%, transparent 8%);
+  color: var(--text);
+  padding: 0.72rem 0.95rem;
+  font-weight: 700;
+  text-decoration: none;
+  box-shadow: var(--shadow-soft);
+}
+
+.auth-skip-link:focus-visible {
+  transform: translateY(0);
+  outline: 2px solid color-mix(in srgb, var(--primary) 60%, transparent 40%);
+  outline-offset: 2px;
 }
 
 .auth-grid-overlay {
@@ -222,16 +315,18 @@ const registerLink = computed(() => {
 }
 
 .auth-stage {
-  padding: 1.3rem;
+  padding: 1.45rem;
   display: grid;
   align-content: start;
-  gap: 0.9rem;
+  gap: 1rem;
 }
 
 .auth-brand-row {
   display: inline-flex;
   align-items: center;
   gap: 0.58rem;
+  width: fit-content;
+  text-decoration: none;
 }
 
 .auth-brand-mark {
@@ -272,9 +367,10 @@ const registerLink = computed(() => {
 
 .auth-stage-subtitle {
   margin: 0;
-  max-width: 40ch;
+  max-width: 42ch;
   color: var(--muted);
-  line-height: 1.62;
+  line-height: 1.68;
+  font-size: 0.98rem;
 }
 
 .auth-stage-metrics {
@@ -321,40 +417,42 @@ const registerLink = computed(() => {
 }
 
 .auth-panel {
-  padding: 1.15rem;
+  padding: 1.35rem;
   display: grid;
   align-content: start;
-  gap: 1rem;
+  gap: 1.15rem;
 }
 
 .auth-panel-head {
   display: grid;
-  gap: 0.28rem;
+  gap: 0.34rem;
 }
 
 .auth-title {
   margin: 0;
-  font-size: 1.45rem;
+  font-size: 1.56rem;
 }
 
 .auth-subtitle {
   margin: 0;
   color: var(--muted);
+  line-height: 1.6;
 }
 
 .auth-form {
   display: grid;
-  gap: 0.8rem;
+  gap: 0.95rem;
 }
 
 .auth-field {
   display: grid;
-  gap: 0.34rem;
+  gap: 0.42rem;
 }
 
 .auth-label {
   font-size: 0.82rem;
   color: var(--muted);
+  font-weight: 700;
 }
 
 .auth-input-wrap {
@@ -363,21 +461,37 @@ const registerLink = computed(() => {
 
 .auth-input {
   width: 100%;
-  min-height: 2.72rem;
-  border-radius: 0.72rem;
+  min-height: 2.92rem;
+  border-radius: 0.8rem;
   border: 1px solid color-mix(in srgb, var(--border) 74%, transparent 26%);
   background: color-mix(in srgb, var(--panel-soft) 74%, transparent 26%);
   color: var(--text);
-  padding: 0.64rem 0.8rem;
+  padding: 0.72rem 0.86rem;
 }
 
 .auth-input.with-toggle {
   padding-right: 2.75rem;
 }
 
+.auth-input.invalid {
+  border-color: color-mix(in srgb, var(--danger) 56%, transparent 44%);
+  background: color-mix(in srgb, var(--danger) 8%, var(--panel-soft) 92%);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--danger) 10%, transparent 90%);
+}
+
 .auth-input:focus-visible {
   outline: 2px solid color-mix(in srgb, var(--primary) 42%, transparent 58%);
   outline-offset: 1px;
+}
+
+.auth-field-note {
+  font-size: 0.8rem;
+  line-height: 1.45;
+  color: var(--muted);
+}
+
+.auth-field-note.error {
+  color: color-mix(in srgb, var(--danger) 82%, var(--text) 18%);
 }
 
 .auth-visibility-btn {
@@ -400,18 +514,59 @@ const registerLink = computed(() => {
   background: color-mix(in srgb, var(--panel-soft) 56%, transparent 44%);
 }
 
+.auth-brand-row:focus-visible,
+.auth-visibility-btn:focus-visible,
+.auth-inline-link:focus-visible,
+.auth-submit:focus-visible,
+.auth-switch-link a:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--primary) 56%, transparent 44%);
+  outline-offset: 3px;
+}
+
+.auth-form-meta {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  margin-top: -0.15rem;
+}
+
+.auth-inline-link {
+  border: 0;
+  background: transparent;
+  padding: 0;
+  color: var(--primary);
+  font-size: 0.84rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.auth-inline-link:hover {
+  text-decoration: underline;
+}
+
+.auth-note,
 .auth-error {
   margin: 0;
-  padding: 0.56rem 0.66rem;
-  border-radius: 0.68rem;
+  padding: 0.68rem 0.8rem;
+  border-radius: 0.8rem;
+  font-size: 0.84rem;
+  line-height: 1.52;
+}
+
+.auth-note {
+  border: 1px solid color-mix(in srgb, var(--primary) 28%, transparent 72%);
+  background: color-mix(in srgb, var(--primary) 10%, transparent 90%);
+  color: color-mix(in srgb, var(--primary) 78%, var(--text) 22%);
+}
+
+.auth-error {
   border: 1px solid color-mix(in srgb, var(--danger) 45%, transparent 55%);
   background: color-mix(in srgb, var(--danger) 14%, transparent 86%);
   color: color-mix(in srgb, var(--danger) 78%, var(--text) 22%);
-  font-size: 0.84rem;
 }
 
 .auth-submit {
-  min-height: 2.78rem;
+  min-height: 2.92rem;
   border: 0;
   border-radius: 0.8rem;
   font-weight: 700;
@@ -431,6 +586,29 @@ const registerLink = computed(() => {
 
 .auth-submit:disabled {
   opacity: 0.58;
+}
+
+.auth-security-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.55rem;
+}
+
+.auth-security-row span {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.42rem;
+  border: 1px solid color-mix(in srgb, var(--border) 72%, transparent 28%);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--panel-soft) 72%, transparent 28%);
+  color: var(--muted);
+  padding: 0.48rem 0.72rem;
+  font-size: 0.78rem;
+  font-weight: 600;
+}
+
+.auth-security-row svg {
+  color: var(--primary);
 }
 
 .auth-switch-link {
@@ -458,7 +636,7 @@ const registerLink = computed(() => {
 
   .auth-stage,
   .auth-panel {
-    padding: 1.4rem;
+    padding: 1.6rem;
   }
 }
 

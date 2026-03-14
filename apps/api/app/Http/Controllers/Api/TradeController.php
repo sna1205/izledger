@@ -236,87 +236,104 @@ class TradeController extends Controller
         $required = $isUpdate ? 'sometimes' : 'required';
         $requiredWithoutLegs = $isUpdate ? 'sometimes' : 'required_without:legs';
 
-        $validator = Validator::make($input, [
-            'account_id' => [$required, 'integer', 'exists:accounts,id'],
-            'instrument_id' => [$required, 'integer', 'exists:instruments,id'],
-            'strategy_model_id' => ['sometimes', 'nullable', 'integer', 'exists:strategy_models,id'],
-            'setup_id' => ['sometimes', 'nullable', 'integer', 'exists:setups,id'],
-            'killzone_id' => ['sometimes', 'nullable', 'integer', 'exists:killzones,id'],
-            'session_enum' => ['sometimes', 'nullable', Rule::in(self::SESSION_ENUM_VALUES)],
-            'tag_ids' => ['sometimes', 'array'],
-            'tag_ids.*' => ['integer', 'exists:trade_tags,id'],
-            'pair' => [$required, 'string', 'max:30', 'regex:/^[A-Z0-9._\/-]+$/i'],
-            'direction' => [$required, 'in:buy,sell'],
-            'entry_price' => [$required, 'numeric', 'gt:0'],
-            'stop_loss' => [$required, 'numeric', 'gt:0'],
-            'take_profit' => [$required, 'numeric', 'gt:0'],
-            'actual_exit_price' => [$requiredWithoutLegs, 'numeric', 'gt:0'],
-            'lot_size' => [$requiredWithoutLegs, 'numeric', 'min:0.0001'],
-            'legs' => ['sometimes', 'array', 'min:1'],
-            'legs.*.leg_type' => ['required_with:legs', 'in:entry,exit'],
-            'legs.*.price' => ['required_with:legs', 'numeric', 'gt:0'],
-            'legs.*.quantity_lots' => ['required_with:legs', 'numeric', 'min:0.0001'],
-            'legs.*.executed_at' => ['nullable', 'date'],
-            'legs.*.fees' => ['sometimes', 'numeric'],
-            'legs.*.notes' => ['nullable', 'string', 'max:2000'],
-            'commission' => ['sometimes', 'numeric', 'min:0'],
-            'swap' => ['sometimes', 'numeric'],
-            'spread_cost' => ['sometimes', 'numeric', 'min:0'],
-            'slippage_cost' => ['sometimes', 'numeric', 'min:0'],
-            'risk_override_reason' => ['nullable', 'string', 'max:2000'],
-            'followed_rules' => [$required, 'boolean'],
-            'checklist_incomplete' => ['sometimes', 'boolean'],
-            'checklist_responses' => ['sometimes', 'array'],
-            'checklist_responses.*.checklist_item_id' => ['required_with:checklist_responses', 'integer', 'exists:checklist_items,id'],
-            'checklist_responses.*.value' => ['nullable'],
-            'checklist_evaluation' => ['sometimes', 'array'],
-            'checklist_evaluation.status' => ['sometimes', 'string', 'max:30'],
-            'checklist_evaluation.ready' => ['sometimes', 'boolean'],
-            'checklist_evaluation.completed_required' => ['sometimes', 'integer', 'min:0'],
-            'checklist_evaluation.total_required' => ['sometimes', 'integer', 'min:0'],
-            'emotion' => [$required, Rule::in(self::EMOTION_VALUES)],
-            'session' => ['sometimes', 'string', 'max:60'],
-            'model' => ['sometimes', 'string', 'max:120'],
-            'date' => [$required, 'date'],
-            'notes' => ['nullable', 'string', 'max:5000'],
+        $validator = Validator::make(
+            $input,
+            [
+                'account_id' => [$required, 'integer', 'exists:accounts,id'],
+                'instrument_id' => [$required, 'integer', 'exists:instruments,id'],
+                'strategy_model_id' => ['sometimes', 'nullable', 'integer', 'exists:strategy_models,id'],
+                'setup_id' => ['sometimes', 'nullable', 'integer', 'exists:setups,id'],
+                'killzone_id' => ['sometimes', 'nullable', 'integer', 'exists:killzones,id'],
+                'session_enum' => ['sometimes', 'nullable', Rule::in(self::SESSION_ENUM_VALUES)],
+                'tag_ids' => ['sometimes', 'array'],
+                'tag_ids.*' => ['integer', 'exists:trade_tags,id'],
+                'pair' => [$required, 'string', 'max:30', 'regex:/^[A-Z0-9._\/-]+$/i'],
+                'direction' => [$required, 'in:buy,sell'],
+                'entry_price' => [$required, 'numeric', 'gt:0'],
+                'stop_loss' => [$required, 'numeric', 'gt:0'],
+                'take_profit' => [$required, 'numeric', 'gt:0'],
+                'actual_exit_price' => [$requiredWithoutLegs, 'numeric', 'gt:0'],
+                'lot_size' => [$requiredWithoutLegs, 'numeric', 'min:0.0001'],
+                'legs' => ['sometimes', 'array', 'min:1'],
+                'legs.*.leg_type' => ['required_with:legs', 'in:entry,exit'],
+                'legs.*.price' => ['required_with:legs', 'numeric', 'gt:0'],
+                'legs.*.quantity_lots' => ['required_with:legs', 'numeric', 'min:0.0001'],
+                'legs.*.executed_at' => ['required_with:legs', 'date'],
+                'legs.*.fees' => ['sometimes', 'numeric'],
+                'legs.*.notes' => ['nullable', 'string', 'max:2000'],
+                'commission' => ['sometimes', 'numeric', 'min:0'],
+                'swap' => ['sometimes', 'numeric'],
+                'spread_cost' => ['sometimes', 'numeric', 'min:0'],
+                'slippage_cost' => ['sometimes', 'numeric', 'min:0'],
+                'risk_override_reason' => ['nullable', 'string', 'max:2000'],
+                'followed_rules' => [$required, 'boolean'],
+                'checklist_incomplete' => ['sometimes', 'boolean'],
+                'checklist_responses' => ['sometimes', 'array'],
+                'checklist_responses.*.checklist_item_id' => ['required_with:checklist_responses', 'integer', 'exists:checklist_items,id'],
+                'checklist_responses.*.value' => ['nullable'],
+                'checklist_evaluation' => ['sometimes', 'array'],
+                'checklist_evaluation.status' => ['sometimes', 'string', 'max:30'],
+                'checklist_evaluation.ready' => ['sometimes', 'boolean'],
+                'checklist_evaluation.completed_required' => ['sometimes', 'integer', 'min:0'],
+                'checklist_evaluation.total_required' => ['sometimes', 'integer', 'min:0'],
+                'emotion' => [$required, Rule::in(self::EMOTION_VALUES)],
+                'session' => ['sometimes', 'string', 'max:60'],
+                'model' => ['sometimes', 'string', 'max:120'],
+                'date' => [$required, 'date'],
+                'notes' => ['nullable', 'string', 'max:5000'],
 
-            // Calculated fields must come from server-side engine only.
-            'risk_per_unit' => ['prohibited'],
-            'reward_per_unit' => ['prohibited'],
-            'monetary_risk' => ['prohibited'],
-            'monetary_reward' => ['prohibited'],
-            'gross_profit_loss' => ['prohibited'],
-            'costs_total' => ['prohibited'],
-            'profit_loss' => ['prohibited'],
-            'rr' => ['prohibited'],
-            'r_multiple' => ['prohibited'],
-            'avg_entry_price' => ['prohibited'],
-            'avg_exit_price' => ['prohibited'],
-            'realized_r_multiple' => ['prohibited'],
-            'risk_percent' => ['prohibited'],
-            'fx_rate_quote_to_usd' => ['prohibited'],
-            'fx_symbol_used' => ['prohibited'],
-            'fx_rate_timestamp' => ['prohibited'],
-            'risk_amount_account_currency' => ['prohibited'],
-            'risk_currency' => ['prohibited'],
-            'fx_rate_used' => ['prohibited'],
-            'fx_pair_used' => ['prohibited'],
-            'fx_rate_provenance_at' => ['prohibited'],
-            'instrument_contract_size' => ['prohibited'],
-            'instrument_quote_to_account_rate' => ['prohibited'],
-            'instrument_quote_currency' => ['prohibited'],
-            'instrument_base_currency' => ['prohibited'],
-            'instrument_rounding_policy' => ['prohibited'],
-            'account_currency' => ['prohibited'],
-            'account_balance_before_trade' => ['prohibited'],
-            'account_balance_after_trade' => ['prohibited'],
-            'executed_checklist_id' => ['prohibited'],
-            'executed_checklist_version' => ['prohibited'],
-            'executed_enforcement_mode' => ['prohibited'],
-            'failed_rule_ids' => ['prohibited'],
-            'failed_rule_titles' => ['prohibited'],
-            'check_evaluated_at' => ['prohibited'],
-        ]);
+                // Calculated fields must come from server-side engine only.
+                'risk_per_unit' => ['prohibited'],
+                'reward_per_unit' => ['prohibited'],
+                'monetary_risk' => ['prohibited'],
+                'monetary_reward' => ['prohibited'],
+                'gross_profit_loss' => ['prohibited'],
+                'costs_total' => ['prohibited'],
+                'profit_loss' => ['prohibited'],
+                'rr' => ['prohibited'],
+                'r_multiple' => ['prohibited'],
+                'avg_entry_price' => ['prohibited'],
+                'avg_exit_price' => ['prohibited'],
+                'realized_r_multiple' => ['prohibited'],
+                'risk_percent' => ['prohibited'],
+                'fx_rate_quote_to_usd' => ['prohibited'],
+                'fx_symbol_used' => ['prohibited'],
+                'fx_rate_timestamp' => ['prohibited'],
+                'risk_amount_account_currency' => ['prohibited'],
+                'risk_currency' => ['prohibited'],
+                'fx_rate_used' => ['prohibited'],
+                'fx_pair_used' => ['prohibited'],
+                'fx_rate_provenance_at' => ['prohibited'],
+                'instrument_contract_size' => ['prohibited'],
+                'instrument_quote_to_account_rate' => ['prohibited'],
+                'instrument_quote_currency' => ['prohibited'],
+                'instrument_base_currency' => ['prohibited'],
+                'instrument_rounding_policy' => ['prohibited'],
+                'account_currency' => ['prohibited'],
+                'account_balance_before_trade' => ['prohibited'],
+                'account_balance_after_trade' => ['prohibited'],
+                'executed_checklist_id' => ['prohibited'],
+                'executed_checklist_version' => ['prohibited'],
+                'executed_enforcement_mode' => ['prohibited'],
+                'failed_rule_ids' => ['prohibited'],
+                'failed_rule_titles' => ['prohibited'],
+                'check_evaluated_at' => ['prohibited'],
+            ],
+            [
+                'date.date' => 'Close date is invalid.',
+                'entry_price.gt' => 'Entry price must be greater than 0.',
+                'stop_loss.gt' => 'Stop loss must be greater than 0.',
+                'take_profit.gt' => 'Take profit must be greater than 0.',
+                'lot_size.min' => 'Position size must be greater than 0.',
+                'lot_size.numeric' => 'Position size must be greater than 0.',
+                'actual_exit_price.required_without' => 'Exit price is required when legs are not supplied.',
+                'actual_exit_price.gt' => 'Exit price must be greater than 0.',
+                'legs.*.price.gt' => 'Leg price must be greater than 0.',
+                'legs.*.quantity_lots.min' => 'Leg quantity must be greater than 0.',
+                'legs.*.executed_at.required_with' => 'Leg execution time is required.',
+                'legs.*.executed_at.date' => 'Leg execution time is invalid.',
+            ]
+        );
 
         $validator->after(function ($validator) use ($input, $isUpdate, $existingTrade): void {
             $legs = $this->normalizeLegsForCalculation(
@@ -330,6 +347,9 @@ class TradeController extends Controller
                 : $this->readFloatFromInputOrTrade($input, 'entry_price', $existingTrade);
             $stopLoss = $this->readFloatFromInputOrTrade($input, 'stop_loss', $existingTrade);
             $takeProfit = $this->readFloatFromInputOrTrade($input, 'take_profit', $existingTrade);
+            $lotSize = $legSummary['entry_quantity'] > 0
+                ? $legSummary['entry_quantity']
+                : $this->readFloatFromInputOrTrade($input, 'lot_size', $existingTrade);
             $direction = (string) ($input['direction'] ?? ($existingTrade?->direction ?? ''));
             $instrumentId = $this->readIntFromInputOrTrade($input, 'instrument_id', $existingTrade);
             $killzoneId = $this->readIntFromInputOrTrade($input, 'killzone_id', $existingTrade);
@@ -340,6 +360,9 @@ class TradeController extends Controller
             }
             if ($entryPrice !== null && $takeProfit !== null && $entryPrice === $takeProfit) {
                 $validator->errors()->add('take_profit', 'Take profit must differ from entry price.');
+            }
+            if ($entryPrice !== null && $stopLoss !== null && $lotSize !== null && ! (abs($entryPrice - $stopLoss) * $lotSize > 0)) {
+                $validator->errors()->add('stop_loss', 'Risk must be greater than 0. Check entry, stop loss, and position size.');
             }
 
             if ($entryPrice !== null && $stopLoss !== null && $takeProfit !== null && in_array($direction, ['buy', 'sell'], true)) {
@@ -372,16 +395,22 @@ class TradeController extends Controller
                 }
 
                 foreach ($legs as $index => $leg) {
-                    $timestamp = strtotime((string) $leg['executed_at']);
-                    if ($timestamp !== false && $timestamp > now()->addMinute()->getTimestamp()) {
+                    $timestamp = $this->parseTimestamp((string) $leg['executed_at']);
+                    if ($timestamp === null) {
+                        $validator->errors()->add("legs.$index.executed_at", 'Leg execution time is invalid.');
+                        continue;
+                    }
+                    if ($timestamp > now()->addMinute()->getTimestamp()) {
                         $validator->errors()->add("legs.$index.executed_at", 'Leg execution time cannot be in the future.');
                     }
                 }
             }
 
             if (array_key_exists('date', $input)) {
-                $timestamp = strtotime((string) $input['date']);
-                if ($timestamp !== false && $timestamp > now()->addMinute()->getTimestamp()) {
+                $timestamp = $this->parseTimestamp((string) $input['date']);
+                if ($timestamp === null) {
+                    $validator->errors()->add('date', 'Close date is invalid.');
+                } elseif ($timestamp > now()->addMinute()->getTimestamp()) {
                     $validator->errors()->add('date', 'Close date cannot be in the future.');
                 }
             }
@@ -545,6 +574,20 @@ class TradeController extends Controller
         $steps = $lotSize / $lotStep;
 
         return abs($steps - round($steps)) < 0.000001;
+    }
+
+    private function parseTimestamp(string $value): ?int
+    {
+        $trimmed = trim($value);
+        if ($trimmed === '') {
+            return null;
+        }
+
+        try {
+            return CarbonImmutable::parse($trimmed)->getTimestamp();
+        } catch (\Throwable) {
+            return null;
+        }
     }
 
     private function normalizedFilterInputs(array $input): array
